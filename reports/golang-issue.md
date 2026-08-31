@@ -138,9 +138,9 @@ exist, so the second does not either. There is no third `ENOENT` clause. POSIX i
 narrower still: with `O_CREAT` set it permits `ENOENT` only when a component of
 the *path prefix* does not name an existing file.
 
-So the bug is the errno. A caller that treats "no such file or directory" as a
-benign, retryable, or absent-file answer gets a wrong answer it has no way to
-tell apart from the truth.
+So the problem is the errno rather than the timing. A caller that reads "no such
+file or directory" as a benign or absent-file answer gets a wrong answer with no
+way to tell it apart from a true one.
 
 The rate depends on how much real parallelism the machine has. A 3-core CI
 runner scores a few percent where a 16-core laptop scores 60% to 79%. A low
@@ -157,7 +157,8 @@ so it inherits this. Plain `os.OpenFile` hands an assembled path to `open(2)`
 once, so it does not. `CGO_ENABLED` makes no difference, because darwin routes
 syscalls through libSystem either way. There is no build-flag workaround.
 
-The isolation is narrow, and that is the useful part. On the same machine,
+The isolation is narrow, which is probably the most useful part for diagnosis. On
+the same machine,
 racing 20 threads on one name: `O_CREAT|O_EXCL`, `openat` with `O_CREAT` on an
 existing file, plain reads through `openat`, and `mkdirat`, `symlinkat`,
 `linkat` and `renameat` are all correct. Only the one operation with a
@@ -178,15 +179,16 @@ Scope of the measurements:
 Probes, controls and a 7-runner CI matrix:
 **https://github.com/Soph/macos-openat-enoent**
 
-### Suggested fix
+### Possible fixes
 
-Two options, both confined to the darwin `openat` path.
+Two options, both of which would sit in the darwin `openat` path.
 
-1. Retry `ENOENT` when `O_CREATE` was requested, bounded. The concern about
-   unbounded retries raised on #75114 has two answers here. xnu's own retry for
-   this condition is bounded at 10 with progressive yielding. And a downstream
-   project that hit this measured retry depth 1 always sufficing, with 0
-   failures in 14,400 attempts ([spiceai/spiceai#13232](https://github.com/spiceai/spiceai/issues/13232)).
+1. Retry `ENOENT` when `O_CREATE` was requested, bounded. On the question of how
+   large a bound needs to be, which came up on #75114, two data points that may
+   help: xnu's own retry for this condition is bounded at 10 with progressive
+   yielding, and a downstream project that hit this measured retry depth 1 always
+   sufficing, with 0 failures in 14,400 attempts
+   ([spiceai/spiceai#13232](https://github.com/spiceai/spiceai/issues/13232)).
 
 2. Split create-or-open into `O_CREATE|O_EXCL` followed by a plain open, so the
    broken path is never taken. This is deterministic rather than probabilistic
@@ -195,28 +197,30 @@ Two options, both confined to the darwin `openat` path.
    in 6000 racing opens to 0, and a flaky test from 12 failures in 20 fresh
    processes to 0 in 20.
 
-We prefer the second, but either would fix it.
+The second is what we used in our own code, for what that is worth. Either looks
+like it would work, and you will have a better sense than I do of which fits the
+package.
 
-I am happy to put together a CL for either option if that is wanted. I have a
-machine that reproduces this reliably and the CI matrix above, so I can verify a
-fix rather than only propose one.
+If a CL would be useful I am happy to write one, for whichever approach you
+prefer. I have a machine that reproduces this reliably and the CI matrix above,
+so I can verify a fix rather than only propose one.
 
-One thing worth deciding early if you do want a CL: a regression test for this
-can only be probabilistic, and only on darwin, since it depends on the scheduler
-leaving the callers overlapping. It may fit better as a stress test than as a
-normal one. I am happy to follow whatever you prefer there.
+One question I would want your view on first: a regression test for this can only
+be probabilistic, and only on darwin, since it depends on the scheduler leaving
+the callers overlapping. It might fit better as a stress test than a normal one,
+but I do not know what you would want there.
 
 ### Related
 
 - #75114, `Root.MkdirAll` returning "file exists" when called concurrently on
   the same path. Same class, different operation. Accepted and fixed in CL
-  698215, backported to 1.24 and 1.25. That is the precedent for treating this
-  as worth working around in Go rather than only as an OS bug.
+  698215, backported to 1.24 and 1.25. Mentioning it in case it is a useful
+  precedent, since that one was also an OS-level race handled on the Go side.
 - #73077 and #73079, `RESOLVE_BENEATH` and `O_NOFOLLOW_ANY`. Current macOS does
   document `O_RESOLVE_BENEATH`, but it would not avoid this, because the flat
   single-component case still goes through `openat` with `O_CREAT`.
 
-### Either way, the documentation is currently wrong
+### A note on the documentation
 
 `os.Root` already documents a list of platform-specific caveats, and one of them
 is a race condition:
@@ -230,13 +234,13 @@ is a race condition:
 >    a symlink while the operation is in progress, the operation may be performed
 >    on the link rather than the link target.
 
-`Root.OpenFile` with `O_CREATE` on darwin is not in that list, and "safe to be
-used from multiple goroutines simultaneously" sits directly above it. So one of
-two things has to change: either the behaviour, or that list gains a fourth
-bullet. As it stands the documentation makes a promise the platform does not
-keep, and callers have no way to know.
+I mention it because that list looks like the natural home for this if the
+behaviour cannot be changed. `Root.OpenFile` with `O_CREATE` on darwin is not in
+it today, and the concurrency sentence sits just above it, so a caller on macOS
+currently has no way to find out.
 
-We would much rather see the behaviour fixed. We intend to report this to Apple
-as well, since the defect is theirs, but an OS fix would reach only future macOS
-versions, while a Go-side change reaches every user on every macOS version they
-are actually running.
+A fix would help callers more than a doc note would, but which of those makes
+sense is your call. I will report this to Apple too, since the defect is
+theirs. The only thing I would add for prioritisation is that an OS fix would
+reach future macOS versions, while a change in Go would reach people on the
+versions they are running today.
