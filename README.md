@@ -1,15 +1,18 @@
 # Spurious `ENOENT` from `openat(O_CREAT)` on macOS
 
 On macOS, when several threads race to `openat(dirfd, name, O_CREAT)` the same
-not-yet-existing name in the same directory, most of them get `ENOENT`. One
-thread creates the file correctly; the others are told the file does not exist —
-the file they themselves asked the kernel to create, and which by then does
-exist.
+not-yet-existing name in the same directory, many of them get `ENOENT` — most of
+them on a machine with enough cores to run them genuinely concurrently, a few
+percent on a 3-core VM. One thread creates the file correctly; the others are
+told the file does not exist — the file they themselves asked to have created,
+and which by then does exist.
 
 `O_CREAT` without `O_EXCL` means *create it, or open it if someone beat me to
 it*. Every caller should get a descriptor. That is what `open(2)` on the
-assembled full path does on the same machine, in the same directory, on the same
-filesystem: 4000 out of 4000 calls succeed. Only the `openat` form fails.
+assembled full path does on the same machine, on the same filesystem, in an
+identically created directory: 4000 out of 4000 calls succeed. Only the `openat`
+form fails. (Each row gets its own fresh temporary directory, so the controls
+share the filesystem and the creation path, not one directory inode.)
 
 This repository is a reproduction, not a fix. It exists to be pasted into a bug
 report.
@@ -27,6 +30,49 @@ $ ./probe.sh
 VERDICT: REPRODUCES -- 2901 of 4000 openat(O_CREAT) calls returned a spurious
          ENOENT; every control row clean
 ```
+
+## Does the documentation say this should work?
+
+Yes, and the `ENOENT` is not a permitted return value.
+
+Apple's own `open(2)` man page covers `openat()` — "The `oflag` argument and the
+optional fourth argument correspond exactly to the arguments for `open()`" — and
+enumerates 26 distinct error conditions. Exactly two of them are `ENOENT`:
+
+```
+[ENOENT]  O_CREAT is not set and the named file does not exist.
+[ENOENT]  A component of the path name that must exist does not exist.
+```
+
+Neither applies. `O_CREAT` *is* set, which disposes of the first. And in
+`openat(dirfd, "n", O_RDWR|O_CREAT, 0600)` the only component is `n` itself —
+the file being created, which is precisely the component that is *not* required
+to exist. Its containing directory is pinned by an open descriptor for the
+duration of the call, so nothing that "must exist" is missing. There is no third
+`ENOENT` clause to fall back on.
+
+POSIX is narrower still. It permits `ENOENT` when `O_CREAT` is set only where "a
+component of the **path prefix** of `path` does not name an existing file" — a
+missing *final* component with `O_CREAT` set is explicitly excluded.
+
+That is not an academic standard to hold macOS to. Apple registers macOS to The
+Open Group's UNIX 03 Product Standard, and macOS 26.0 Tahoe is registered on
+[Apple silicon](https://www.opengroup.org/openbrand/register/brand3725.htm) and
+on [Intel](https://www.opengroup.org/openbrand/register/brand3720.htm), both
+dated 29-Aug-2025 — the same two architectures this reproduces on.
+
+**The counter-argument, stated fairly.** POSIX's explicit *atomicity* guarantee
+is scoped to `O_CREAT|O_EXCL`: "The check for the existence of the file and the
+creation of the file if it does not exist shall be atomic with respect to other
+threads executing `open()` naming the same filename in the same directory **with
+`O_EXCL` and `O_CREAT` set**." So one can argue POSIX never promised that
+`O_CREAT` *without* `O_EXCL` is atomic, and that is correct.
+
+It does not rescue the behaviour, because the complaint is not about atomicity.
+Even a deliberately non-atomic implementation must either succeed or fail with
+one of the enumerated errors, and `ENOENT` is not one of them for this case in
+either Apple's documentation or POSIX's. The defect is the errno, not the
+interleaving.
 
 ## Running it
 
@@ -46,8 +92,9 @@ turned out not to be fail-closed, `1` on a build failure.
 The probes can also be run individually:
 
 ```sh
-cc -O2 -pthread -std=gnu11 -o openat_race c/openat_race.c && ./openat_race 20 200
+cc -O2 -pthread -std=gnu11 -o openat_race    c/openat_race.c    && ./openat_race 20 200
 cc -O2 -pthread -std=gnu11 -o other_syscalls c/other_syscalls.c && ./other_syscalls 20 200
+cc -O2 -pthread -std=gnu11 -o failclosed     c/failclosed.c     && ./failclosed 20 200
 cd go && go run . -threads 20 -trials 50
 ```
 
@@ -60,10 +107,18 @@ then 20×1000, then 40×1000 — and stops at the first size that reproduces. Th
 `size` column of the results table says which stage answered, and a `stage 1`
 clean row means only that the smallest size found nothing.
 
-A run is also only interpretable if the controls are clean. Both C probes and the
-Go probe carry their own controls and say so in their verdict; a control failing
-is reported as `ANOMALOUS` and means something is wrong with the harness or the
-environment. Do not quote a number from an `ANOMALOUS` run.
+Stages 2 and 3 run the key rows only — the suspect row plus the `O_EXCL` and
+full-path `open(2)` controls. The two existing-file controls are checked at
+stage 1, so a result reported from stage 2 or 3 has rechecked three of the five
+controls, not all five.
+
+A run is also only interpretable if the controls are clean. Every probe carries
+its own controls and enforces them in its exit code: a control returning
+`ENOENT`, **or any call failing with an unexpected errno**, is reported as
+`ANOMALOUS`. That second half matters — squeeze the descriptor table with
+`ulimit -n 16` and every row starts returning `EMFILE`, and an earlier version
+of this probe called that "every control row clean" and printed `REPRODUCES`.
+Do not quote a number from an `ANOMALOUS` run.
 
 ## What was measured
 
@@ -83,7 +138,11 @@ interpretable, and they were clean on both.
 ### GitHub-hosted runners
 
 Every macOS image GitHub currently offers, plus Linux on both architectures,
-from one run of `.github/workflows/matrix.yml` on 2026-08-31:
+from [this run](https://github.com/Soph/macos-openat-enoent/actions/runs/33392639312)
+of `.github/workflows/matrix.yml` on 2026-08-31, at commit
+[`22adc62`](https://github.com/Soph/macos-openat-enoent/commit/22adc62e2840b75301b8fa0c9150c2f03c441177).
+Per-runner logs and the raw records are attached to that run as `result-*`
+artifacts:
 
 | runner | OS | build | arch | cores | CPU | size | spurious `ENOENT` | verdict | Go 1.27.0 |
 | --- | --- | --- | --- | --: | --- | --- | --: | --- | --- |
@@ -101,21 +160,25 @@ Four things follow.
 
 **It is not architecture-specific.** Both `-intel` legs are real Intel hardware —
 a Core i7-8700B, not a virtualised M1 — and both reproduce, at the same rate as
-the arm64 legs on the same OS version. arm64's weaker memory model is therefore
-not needed to explain this, which makes a missing barrier the less likely story
-and an architecture-independent logic bug in the create-or-open fallback the
-more likely one. The two same-OS pairs are what settle it: 15.7.7/arm64 at 6%
-against 15.7.9/x86_64 at 6%, and 26.5.2/arm64 at 7% against 26.6.1/x86_64 at 6%.
+the arm64 legs of the same macOS generation. arm64's weaker memory model is
+therefore not needed to explain this, which makes a missing barrier the less
+likely story and an architecture-independent defect in the create-or-open
+fallback the more likely one. The two generation pairs: 15.7.7/arm64 at 6%
+against 15.7.9/x86_64 at 6%, and 26.5.2/arm64 at 7% against 26.6.1/x86_64 at
+6%. They are adjacent patch builds rather than identical ones — GitHub does not
+offer the same build on both architectures — so this supports "arm64 is not
+required" rather than a build-for-build comparison.
 
 **It is not a macOS 26 regression.** It reproduces on Sonoma 14.8.7, on Sequoia
 15.7.7 and 15.7.9, and on Tahoe 26.5.2, 26.6.1, 26.6 and 26.6.2 — every macOS
 version testable here. macOS 13 and earlier cannot be tested on GitHub-hosted
 runners any more, so how much further back it goes is still open.
 
-**Linux is unaffected at ten times the volume.** Both Linux legs climbed the
-ladder to 40 threads × 1000 trials and returned 0 spurious `ENOENT` out of
+**Linux did not reproduce it at ten times the volume.** Both Linux legs climbed
+the ladder to 40 threads × 1000 trials and returned 0 spurious `ENOENT` out of
 40000 calls, on both architectures, running the same source. That is the control
-that rules out the harness.
+that rules out the harness. It is absence of observation at that size, not proof
+of immunity.
 
 **The rate tracks available parallelism, not severity.** The runners score 6–9%
 on 3–4 cores where a 16-core laptop scores 66–79%. A low number on a small
@@ -151,20 +214,41 @@ resolution, because the row above it resolves the same path the same way.
 
 ### It is fail-closed
 
-Worth stating explicitly, because "the kernel says a file does not exist when it
-does" invites the assumption that something worse is available. Every probe
-checks for it, on every row, and none of it happens:
+Worth stating explicitly, because "the system says a file does not exist when it
+does" invites the assumption that something worse is available.
+`c/openat_race.c` checks for it on every row, and `c/failclosed.c` checks again
+in the two directory shapes an attacker would choose. None of it happens:
 
 - some thread always won — never a trial with zero successes;
 - the file always existed afterwards;
 - every successful opener saw the same inode — no inode confusion;
 - the mode was always the one requested — no permission corruption.
 
-Two variants shaped like the classic `/tmp` attack were probed separately, at
-200 trials × 20 threads: with the raced name a **dangling symlink pointing out of
-the directory**, the symlink was never clobbered into a regular file, the target
-was always the file that got created, and no opener ever received a non-target
-inode. The same held in a **world-writable sticky (`01777`) directory**.
+`c/failclosed.c` runs the same race in three directory shapes, including the two
+shaped like the classic `/tmp` attack, and enforces the result in its exit code:
+
+```
+  plain private directory            ok=   803 spurious-ENOENT=  2197 other=0
+      no-winner trials=0  inode-divergent=0  wrong-mode=0  name-missing-after=0
+  raced name is a DANGLING SYMLINK   ok=   905 spurious-ENOENT=  2095 other=0
+      no-winner trials=0  inode-divergent=0  wrong-mode=0  symlink-clobbered=0
+      target-not-created=0  opener-saw-wrong-object=0
+  world-writable STICKY dir (01777)  ok=   751 spurious-ENOENT=  2249 other=0
+      no-winner trials=0  inode-divergent=0  wrong-mode=0  name-missing-after=0
+
+VERDICT: FAIL-CLOSED
+```
+
+With the raced name a **dangling symlink pointing out of the directory**, the
+symlink was never clobbered into a regular file, its target was always the thing
+created, and no opener ever received a non-target inode. The same held in a
+**world-writable sticky (`01777`) directory**. If any of that ever fails the
+program exits 3 and says the finding belongs in a security report instead.
+
+Scope, so this is not read as more than it is: the four integrity checks are
+made by the two C probes. The Go probe only counts errors, and
+`c/other_syscalls.c` checks only for a second winner and for the name going
+missing.
 
 So the defect forges one errno — `ENOENT`, "does not exist" — and nothing else.
 It is an amplifier for callers that treat "does not exist" as a benign, safe
@@ -177,7 +261,7 @@ tracker rather than a security address.
 that a path cannot escape the root. That is the entire point of the type, and it
 is documented as safe for concurrent use. It also means `os.Root` inherits this
 defect, while plain `os.OpenFile` — which hands the assembled path to `open(2)`
-once — does not:
+once — did not reproduce it in any of these runs:
 
 ```
   row                                      ok   ENOENT   EEXIST  other
@@ -210,10 +294,17 @@ worst case, and the one that led here.
 ### The harness
 
 The reproduction is in plain C with no Go involved, so the defect is below the Go
-runtime. To keep the harness itself from being the story:
+runtime — in the platform's `openat` path. Everything here goes through
+libSystem, so these probes do not by themselves separate the kernel from the
+libc wrapper; assigning it specifically to XNU would need syscall tracing, which
+this repository does not do. To keep the harness itself from being the story:
 
-- both C probes build warning-free under Apple clang and GCC 16, at
-  `-Wall -Wextra`, and under strict `-std=c11` as well as `-std=gnu11`;
+- all three C probes build warning-free under Apple clang and GCC 16, at
+  `-Wall -Wextra -Werror`, under strict `-std=c11` as well as `-std=gnu11`;
+- every probe enforces its own claim in its exit code rather than leaving it to
+  the reader: an unexpected errno anywhere makes a run `ANOMALOUS` (exit 2), a
+  second misbehaving syscall makes `other_syscalls` `NOT-ISOLATED`, and a
+  fail-closed violation makes `failclosed` `NOT-FAIL-CLOSED` (exit 3);
 - `openat_race.c` under `-fsanitize=thread` reports **no data races**, and still
   reproduces at 105 out of 120 calls;
 - the threads are released through a two-phase barrier — arrive on a condition
@@ -230,8 +321,8 @@ collects the records into one table in the run summary.
 
 | leg | why it is there |
 | --- | --- |
-| `macos-26`, `macos-26-intel` | same OS, both architectures |
-| `macos-15`, `macos-15-intel` | same OS, both architectures, one release back |
+| `macos-26`, `macos-26-intel` | same macOS generation, both architectures |
+| `macos-15`, `macos-15-intel` | same again, one generation back |
 | `macos-14` | oldest image GitHub still offers |
 | `ubuntu-24.04`, `ubuntu-24.04-arm` | same source, same probes, must come out clean |
 
@@ -278,19 +369,26 @@ It is one line in the matrix.
   `O_NOFOLLOW_ANY` on macOS. `O_NOFOLLOW` is not the trigger here: it changes
   nothing either way.
 
+Worth noting for both of those: current macOS `open(2)` documents
+`O_NOFOLLOW_ANY`, `O_RESOLVE_BENEATH` and `O_UNIQUE`, so darwin does have a
+confining-resolution flag of its own. It would not avoid this bug — the flat
+single-component case still goes through `openat` with `O_CREAT` — but it is
+relevant to how `os.Root` could resolve paths on darwin.
+
 ## Layout
 
 ```
 probe.sh                       build and run everything; prints one record line
 c/openat_race.c                the headline probe: 1 suspect row, 5 controls
 c/other_syscalls.c             mkdirat / symlinkat / linkat / renameat for contrast
+c/failclosed.c                 is it fail-closed? incl. the two attack shapes
 go/main.go                     os.Root vs plain os.*, with controls
 ci/summarize.sh                records -> markdown table
 .github/workflows/matrix.yml   the runner matrix
 ```
 
-Each C file carries its own copy of the release barrier so that either one can
-be read, built or pasted on its own.
+Each C file carries its own copy of the release barrier so that any one of them
+can be read, built or pasted on its own.
 
 ## License
 

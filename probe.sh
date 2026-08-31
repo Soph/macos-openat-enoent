@@ -15,8 +15,10 @@
 #
 # Exit: 0 every probe interpretable (whether it reproduced or was clean)
 #       1 build or setup failure
-#       2 a control row failed somewhere -- suspect the harness or the machine
-#       3 the race was not fail-closed; that is a new finding, read the output
+#       2 a control row returned ENOENT, or some call failed with an unexpected
+#         errno -- suspect the harness or the machine, not the kernel
+#       3 a probe found something STRONGER than expected: the race was not
+#         fail-closed, or a syscall other than openat misbehaved too
 #
 # Written for bash 3.2, which is what macOS ships.
 set -u
@@ -81,7 +83,7 @@ echo
 
 # ------------------------------------------------------------------ build ---
 
-for src in openat_race other_syscalls; do
+for src in openat_race other_syscalls failclosed; do
     if ! cc -O2 -pthread -std=gnu11 -Wall -Wextra -o "$bin/$src" "$here/c/$src.c"; then
         echo "FATAL: failed to build c/$src.c" >&2
         exit 1
@@ -120,14 +122,28 @@ for spec in "$threads $trials all" "$threads $((trials * 5)) key" "$((threads * 
     [ "$c_verdict" = "CLEAN" ] || break
     if [ "$stage" -lt 3 ]; then
         echo "    clean at this size -- raising it before calling the machine clean"
+        echo "    (stages 2 and 3 run the key rows only: the suspect row, O_EXCL"
+        echo "     and the full-path open control. The existing-file controls are"
+        echo "     checked at stage 1.)"
         echo
     fi
 done
 note_rc "$c_rc"
 
 echo "--- C probe, other name-creating syscalls ---"
-"$bin/other_syscalls" "$threads" "$trials" 2>&1
-note_rc $?
+osc_log=$bin/osc.log
+"$bin/other_syscalls" "$threads" "$trials" 2>&1 | tee "$osc_log"
+note_rc "${PIPESTATUS[0]}"
+osc_verdict=$(sum_get "$(grep '^SUMMARY ' "$osc_log" | tail -1)" verdict)
+[ -n "$osc_verdict" ] || osc_verdict="?"
+echo
+
+echo "--- C probe, is the race fail-closed? (incl. the two attack shapes) ---"
+fc_log=$bin/fc.log
+"$bin/failclosed" "$threads" "$trials" 2>&1 | tee "$fc_log"
+note_rc "${PIPESTATUS[0]}"
+fc_verdict=$(sum_get "$(grep '^SUMMARY ' "$fc_log" | tail -1)" verdict)
+[ -n "$fc_verdict" ] || fc_verdict="?"
 echo
 
 # ------------------------------------------------------------- Go probe ----
@@ -153,10 +169,10 @@ fi
 
 # ---------------------------------------------------------------- record ----
 
-record=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+record=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "$label" "$os_name" "$os_version" "$os_build" "$arch" "$cores" "$cpu" "$fstype" \
     "$stage" "$c_threads" "$c_trials" "$c_calls" "$c_suspect" "$c_control" "$c_verdict" \
-    "$go_version" "$go_verdict:$go_suspect/$go_calls")
+    "$go_version" "$go_verdict:$go_suspect/$go_calls" "$osc_verdict" "$fc_verdict")
 
 echo "RECORD	$record"
 if [ -n "${RESULT_TSV:-}" ]; then
@@ -165,9 +181,12 @@ fi
 
 echo
 case "$worst" in
-0) echo "OVERALL: every probe interpretable (C verdict: $c_verdict, Go verdict: $go_verdict)" ;;
-2) echo "OVERALL: ANOMALOUS -- a control row failed. Suspect the harness or this machine." ;;
-3) echo "OVERALL: INTEGRITY -- the race was not fail-closed here. Read the tables above." ;;
+0) echo "OVERALL: every probe interpretable -- openat=$c_verdict isolation=$osc_verdict" \
+        "fail-closed=$fc_verdict go=$go_verdict" ;;
+2) echo "OVERALL: ANOMALOUS -- a control row returned ENOENT, or a call failed with an" \
+        "unexpected errno. Suspect the harness or this machine, not the kernel." ;;
+3) echo "OVERALL: a probe reported a STRONGER finding than expected (the race was not" \
+        "fail-closed, or a second syscall misbehaved). Read the tables above." ;;
 *) echo "OVERALL: a probe failed to run (exit $worst)" ;;
 esac
 exit "$worst"

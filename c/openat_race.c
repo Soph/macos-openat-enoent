@@ -33,8 +33,9 @@
  *
  * Exit: 0 interpretable (REPRODUCES or CLEAN)
  *       1 usage or setup error
- *       2 ANOMALOUS -- a control row failed too, so suspect the harness or the
- *         environment, not the kernel
+ *       2 ANOMALOUS -- a control row returned ENOENT too, or any row failed with
+ *         an unexpected errno, so suspect the harness or the environment rather
+ *         than the kernel
  *       3 INTEGRITY -- the race was not fail-closed. That is a new and worse
  *         finding than this program was written to look for; report it.
  */
@@ -215,7 +216,10 @@ static struct result run_row(const struct row *r, int nt, int trials) {
             sched_yield();
         atomic_store_explicit(&g_gate, 1, memory_order_release);
 
-        for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+        for (int i = 0; i < nt; i++) {
+            int e = pthread_join(th[i], NULL);
+            if (e) { fprintf(stderr, "pthread_join: %s\n", strerror(e)); exit(1); }
+        }
 
         long ok = atomic_load(&c_ok);
         res.ok += ok;
@@ -306,13 +310,21 @@ int main(int argc, char **argv) {
     printf("  %-40s %8s %8s %8s %6s  %s\n",
            "row", "ok", "ENOENT", "EEXIST", "other", "integrity");
 
-    long suspect_ok = 0, suspect_enoent = 0, control_enoent = 0;
-    int integ = 0;
+    long suspect_ok = 0, suspect_enoent = 0, control_enoent = 0, other_total = 0;
+    int integ = 0, last_other_errno = 0;
     for (int i = 0; i < nrows; i++) {
         if (keyonly && !rows[i].key) continue;
         struct result s = run_row(&rows[i], nt, trials);
         print_row(&rows[i], &s);
         integ += integrity_anomalies(&s);
+        /* An unexpected errno on ANY row makes the whole run uninterpretable,
+         * not just a footnote. Exhaust the fd table with `ulimit -n 32` and
+         * every row starts returning EMFILE; a verdict that only looked at
+         * ENOENT counts called that "every control row clean" and reported
+         * REPRODUCES, which is exactly the kind of number that should never
+         * reach a bug tracker. */
+        other_total += s.other;
+        if (s.other) last_other_errno = s.last_errno;
         if (rows[i].suspect) { suspect_ok = s.ok; suspect_enoent = s.enoent; }
         else control_enoent += s.enoent;
     }
@@ -322,7 +334,7 @@ int main(int argc, char **argv) {
     if (integ > 0) {
         verdict = "INTEGRITY";
         rc = 3;
-    } else if (control_enoent > 0) {
+    } else if (control_enoent > 0 || other_total > 0) {
         verdict = "ANOMALOUS";
         rc = 2;
     } else if (suspect_enoent > 0) {
@@ -334,9 +346,10 @@ int main(int argc, char **argv) {
     }
 
     printf("\nSUMMARY threads=%d trials=%d calls_per_row=%d suspect_calls=%d suspect_ok=%ld"
-           " suspect_enoent=%ld control_enoent=%ld integrity_anomalies=%d verdict=%s\n",
+           " suspect_enoent=%ld control_enoent=%ld unexpected_errno=%ld"
+           " integrity_anomalies=%d verdict=%s\n",
            nt, trials, nt * trials, nt * trials, suspect_ok, suspect_enoent,
-           control_enoent, integ, verdict);
+           control_enoent, other_total, integ, verdict);
     printf("VERDICT: ");
     switch (rc) {
     case 0:
@@ -348,9 +361,15 @@ int main(int argc, char **argv) {
                    " every control row clean\n");
         break;
     case 2:
-        printf("ANOMALOUS -- %ld control-row ENOENT. A control failing means the"
-               " harness or the environment is at fault, not the kernel."
-               " Investigate before reporting anything.\n", control_enoent);
+        if (control_enoent > 0)
+            printf("ANOMALOUS -- %ld control-row ENOENT", control_enoent);
+        else
+            printf("ANOMALOUS -- no control-row ENOENT, but %ld call(s) failed with an"
+                   " unexpected errno (last: %d %s)", other_total, last_other_errno,
+                   strerror(last_other_errno));
+        printf(". Either means the harness or the environment is at fault rather than"
+               " the kernel -- a resource limit (try `ulimit -n`) will do it."
+               " Investigate before reporting anything.\n");
         break;
     case 3:
         printf("INTEGRITY -- the race was not fail-closed on this machine."

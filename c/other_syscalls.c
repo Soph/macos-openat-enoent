@@ -5,11 +5,17 @@
  * directory, and it is not the only one that can lose a race for that name.
  * This program races N threads on one name through each of them in turn.
  *
- * For everything except renameat the correct outcome is: exactly one winner,
- * EEXIST for everyone else, and no ENOENT anywhere -- the name did not exist
- * when the call started and the caller is the one creating it, so "no such
- * file or directory" is never a truthful answer. renameat replaces the
- * destination, so there every thread legitimately succeeds.
+ * Correct behaviour differs by row, and the difference matters:
+ *
+ *   - openat with O_CREAT and no O_EXCL, and renameat, should let EVERY thread
+ *     succeed. O_CREAT without O_EXCL means "create it, or open it if someone
+ *     beat me to it", and renameat replaces its destination.
+ *   - O_EXCL, mkdirat, symlinkat and linkat should produce exactly ONE winner
+ *     and EEXIST for everyone else, because each is a create-or-fail.
+ *
+ * What no row should ever produce is ENOENT: the name did not exist when the
+ * call started and the caller is the one creating it, so "no such file or
+ * directory" is not a truthful answer for any of them.
  *
  * The point of the table is the contrast. openat O_CREAT|O_EXCL is the same
  * syscall, the same path resolution and the same directory, and it is clean.
@@ -24,7 +30,11 @@
  * The arming barrier below is deliberately a copy of the one in
  * openat_race.c, so that either file can be read, built or pasted on its own.
  *
- * Exit: 0 ran, 1 usage or setup error.
+ * Exit: 0 ISOLATED (only non-EXCL openat misbehaves) or CLEAN (nothing does)
+ *       1 usage or setup error
+ *       2 ANOMALOUS -- an unexpected errno appeared, so the run says nothing
+ *       3 NOT-ISOLATED -- a second syscall misbehaved too, which is a broader
+ *         finding than the one being reported
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -132,8 +142,11 @@ struct row {
     int all_win;           /* renameat replaces, so every thread may succeed */
 };
 
+static int last_row_errno;
+
 static long run_row(const struct row *r, int nt, int trials,
-                    long *enoent_out, int *multi_winner_out, int *missing_out) {
+                    long *enoent_out, long *other_out,
+                    int *multi_winner_out, int *missing_out) {
     long ok = 0, enoent = 0, eexist = 0, other = 0;
     int last_errno = 0, multi_winner = 0, missing = 0;
 
@@ -183,7 +196,10 @@ static long run_row(const struct row *r, int nt, int trials,
         while (atomic_load(&g_spinning) < nt)
             sched_yield();
         atomic_store_explicit(&g_gate, 1, memory_order_release);
-        for (int i = 0; i < nt; i++) pthread_join(th[i], NULL);
+        for (int i = 0; i < nt; i++) {
+            int e = pthread_join(th[i], NULL);
+            if (e) { fprintf(stderr, "pthread_join: %s\n", strerror(e)); exit(1); }
+        }
 
         long trial_ok = atomic_load(&c_ok);
         ok += trial_ok;
@@ -218,8 +234,10 @@ static long run_row(const struct row *r, int nt, int trials,
         printf("  %-32s   (last unexpected errno: %d %s)\n",
                "", last_errno, strerror(last_errno));
     *enoent_out = enoent;
+    *other_out = other;
     *multi_winner_out = multi_winner;
     *missing_out = missing;
+    last_row_errno = last_errno;
     return ok;
 }
 
@@ -246,24 +264,69 @@ int main(int argc, char **argv) {
     printf("other_syscalls: %d threads x %d trials racing ONE name = %d calls per row\n",
            nt, trials, nt * trials);
     printf("temp dirs under: %s\n", parent_dir());
-    printf("correct for every row but renameat: exactly one winner, rest EEXIST, zero ENOENT\n\n");
+    printf("correct: all threads win for non-EXCL openat and renameat, exactly one\n");
+    printf("wins for the create-or-fail rows -- and zero ENOENT for every row.\n\n");
     printf("  %-32s %8s %8s %8s %6s  %s\n",
            "syscall racing one name", "ok", "ENOENT", "EEXIST", "other", "integrity");
 
     char dirty[512] = "";
+    long openat_enoent = 0, elsewhere_enoent = 0, other_total = 0;
+    int structural = 0, last_other_errno = 0;
     for (int i = 0; i < nrows; i++) {
-        long enoent; int multi, missing;
-        run_row(&rows[i], nt, trials, &enoent, &multi, &missing);
-        if (enoent > 0) {
+        long enoent, other; int multi, missing;
+        run_row(&rows[i], nt, trials, &enoent, &other, &multi, &missing);
+        other_total += other;
+        if (other) last_other_errno = last_row_errno;
+        structural += multi + missing;
+        if (rows[i].op == OP_OPENAT) {
+            openat_enoent += enoent;
+        } else if (enoent > 0) {
+            elsewhere_enoent += enoent;
             strncat(dirty, dirty[0] ? ", " : "", sizeof dirty - strlen(dirty) - 1);
             strncat(dirty, rows[i].label, sizeof dirty - strlen(dirty) - 1);
         }
     }
 
-    printf("\nVERDICT: ");
-    if (!dirty[0])
-        printf("no spurious ENOENT from any of these syscalls at this size\n");
-    else
-        printf("spurious ENOENT from: %s\n", dirty);
-    return 0;
+    /* The isolation claim is the point of this program, so it is enforced here
+     * rather than left for a reader to eyeball. A second syscall misbehaving
+     * would be a broader and more serious finding than the one being reported,
+     * and must not exit 0 alongside it. */
+    const char *verdict;
+    int rc;
+    if (other_total > 0)          { verdict = "ANOMALOUS";    rc = 2; }
+    else if (elsewhere_enoent || structural) { verdict = "NOT-ISOLATED"; rc = 3; }
+    else if (openat_enoent > 0)   { verdict = "ISOLATED";     rc = 0; }
+    else                          { verdict = "CLEAN";        rc = 0; }
+
+    printf("\nSUMMARY threads=%d trials=%d calls_per_row=%d openat_enoent=%ld"
+           " other_syscall_enoent=%ld structural_anomalies=%d unexpected_errno=%ld"
+           " verdict=%s\n",
+           nt, trials, nt * trials, openat_enoent, elsewhere_enoent, structural,
+           other_total, verdict);
+    printf("VERDICT: ");
+    switch (rc) {
+    case 0:
+        if (openat_enoent > 0)
+            printf("ISOLATED -- %ld spurious ENOENT, all of it from openat O_CREAT"
+                   " without O_EXCL; every other name-creating syscall clean\n",
+                   openat_enoent);
+        else
+            printf("CLEAN -- no spurious ENOENT from any of these syscalls at this size\n");
+        break;
+    case 2:
+        printf("ANOMALOUS -- %ld call(s) failed with an unexpected errno (last: %d %s),"
+               " so this run says nothing about isolation. Check `ulimit -n`.\n",
+               other_total, last_other_errno, strerror(last_other_errno));
+        break;
+    case 3:
+        if (elsewhere_enoent)
+            printf("NOT ISOLATED -- spurious ENOENT also from: %s. That is broader than"
+                   " the reported bug; re-run and report it.\n", dirty);
+        else
+            printf("NOT ISOLATED -- %d structural anomal%s (a second winner, or the name"
+                   " missing afterwards). Re-run and report it.\n",
+                   structural, structural == 1 ? "y" : "ies");
+        break;
+    }
+    return rc;
 }
