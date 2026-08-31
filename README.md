@@ -80,13 +80,20 @@ one of the enumerated errors, and `ENOENT` is not one of them for this case in
 either Apple's documentation or POSIX's. The defect is the errno, not the
 interleaving.
 
-## Has this been reported before?
+## Reported at
 
-Not upstream. There is no golang/go issue for it (all 40 `os.Root` issues, open
-and closed, checked 2026-08-31; the closest is
+- **Go: [golang/go#81246](https://github.com/golang/go/issues/81246)**, filed
+  2026-08-31. The report text is kept in
+  [`reports/golang-issue.md`](reports/golang-issue.md).
+- Apple: not yet filed.
+
+## Had it been reported before?
+
+Not upstream. Before filing there was no golang/go issue for it (all 40
+`os.Root` issues, open and closed, checked 2026-08-31; the closest is
 [#75114](https://github.com/golang/go/issues/75114), a different operation), and
-no public Apple report — though Feedback Assistant is not publicly searchable, so
-that shows only that nothing public exists.
+no public Apple report. Feedback Assistant is not publicly searchable, so that
+shows only that nothing public existed.
 
 It has been hit and fixed downstream at least once, independently:
 [spiceai/spiceai#13232](https://github.com/spiceai/spiceai/issues/13232),
