@@ -67,20 +67,60 @@ environment. Do not quote a number from an `ANOMALOUS` run.
 
 ## What was measured
 
-Two machines so far, both Apple silicon, 20 threads × 200 trials = 4000 calls:
+### Laptops
 
-| machine | macOS | build | spurious `ENOENT` | controls |
-| --- | --- | --- | --: | --- |
-| M4 Max | 26.6 | 25G72 | 2638–3147 / 4000 | clean |
-| M5 | 26.6.2 | 25G83 | 1544 / 4000 | clean |
+Both Apple silicon, 20 threads × 200 trials = 4000 calls:
+
+| machine | macOS | build | cores | spurious `ENOENT` | controls |
+| --- | --- | --- | --: | --: | --- |
+| M4 Max | 26.6 | 25G72 | 16 | 2638–3147 / 4000 (66–79%) | clean |
+| M5 | 26.6.2 | 25G83 | — | 1544 / 4000 (39%) | clean |
 
 The rate swings a lot with scheduling — 966 to 3034 on one machine across runs —
 so the absolute number means little. The controls are what make a run
 interpretable, and they were clean on both.
 
-Both machines were still affected on the two most recent macOS patch releases,
-so this is not something a `.1` or `.2` has fixed, and it is not specific to one
-SoC generation.
+### GitHub-hosted runners
+
+Every macOS image GitHub currently offers, plus Linux on both architectures,
+from one run of `.github/workflows/matrix.yml` on 2026-08-31:
+
+| runner | OS | build | arch | cores | CPU | size | spurious `ENOENT` | verdict | Go 1.27.0 |
+| --- | --- | --- | --- | --: | --- | --- | --: | --- | --- |
+| `macos-14` | macOS 14.8.7 | 23J520 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 362 / 4000 (9%) | **REPRODUCES** | 45 / 2000 |
+| `macos-15` | macOS 15.7.7 | 24G720 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 223 / 4000 (6%) | **REPRODUCES** | 57 / 2000 |
+| `macos-26` | macOS 26.5.2 | 25F84 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 288 / 4000 (7%) | **REPRODUCES** | 71 / 2000 |
+| `macos-15-intel` | macOS 15.7.9 | 24G830 | x86_64 | 4 | Core i7-8700B | 20×200 | 231 / 4000 (6%) | **REPRODUCES** | 41 / 2000 |
+| `macos-26-intel` | macOS 26.6.1 | 25G76 | x86_64 | 4 | Core i7-8700B | 20×200 | 220 / 4000 (6%) | **REPRODUCES** | 35 / 2000 |
+| `ubuntu-24.04` | Ubuntu 24.04.4, 6.17.0 | — | x86_64 | 4 | Xeon Platinum 8573C | 40×1000 | 0 / 40000 | clean | 0 / 2000 |
+| `ubuntu-24.04-arm` | Ubuntu 24.04.4, 6.17.0 | — | arm64 | 4 | — | 40×1000 | 0 / 40000 | clean | 0 / 2000 |
+
+Every control row was clean and every row was fail-closed, on all seven.
+
+Four things follow.
+
+**It is not architecture-specific.** Both `-intel` legs are real Intel hardware —
+a Core i7-8700B, not a virtualised M1 — and both reproduce, at the same rate as
+the arm64 legs on the same OS version. arm64's weaker memory model is therefore
+not needed to explain this, which makes a missing barrier the less likely story
+and an architecture-independent logic bug in the create-or-open fallback the
+more likely one. The two same-OS pairs are what settle it: 15.7.7/arm64 at 6%
+against 15.7.9/x86_64 at 6%, and 26.5.2/arm64 at 7% against 26.6.1/x86_64 at 6%.
+
+**It is not a macOS 26 regression.** It reproduces on Sonoma 14.8.7, on Sequoia
+15.7.7 and 15.7.9, and on Tahoe 26.5.2, 26.6.1, 26.6 and 26.6.2 — every macOS
+version testable here. macOS 13 and earlier cannot be tested on GitHub-hosted
+runners any more, so how much further back it goes is still open.
+
+**Linux is unaffected at ten times the volume.** Both Linux legs climbed the
+ladder to 40 threads × 1000 trials and returned 0 spurious `ENOENT` out of
+40000 calls, on both architectures, running the same source. That is the control
+that rules out the harness.
+
+**The rate tracks available parallelism, not severity.** The runners score 6–9%
+on 3–4 cores where a 16-core laptop scores 66–79%. A low number on a small
+machine is not a mild version of the bug; it is the same bug with fewer chances
+to land.
 
 ### It is one operation, not path resolution
 
@@ -151,7 +191,8 @@ once — does not:
 
 The error surfaces as `openat f: no such file or directory` wrapping
 `fs.ErrNotExist`, which is exactly the error a caller reads as "not there yet".
-Reproduced on Go 1.26.6, 1.26.7 and 1.27.0; not fixed in any of them.
+Reproduced on Go 1.26.6, 1.26.7 and 1.27.0, on both `darwin/arm64` and
+`darwin/amd64`; not fixed in any of them.
 
 Nesting is irrelevant — a flat single-component name fails as hard as `d/f` —
 and so is concurrent creation of the parent directory. The trigger is narrowly
@@ -194,17 +235,21 @@ collects the records into one table in the run summary.
 | `macos-14` | oldest image GitHub still offers |
 | `ubuntu-24.04`, `ubuntu-24.04-arm` | same source, same probes, must come out clean |
 
-The two same-OS architecture pairs are the point. arm64 has a weaker memory
-model than x86's TSO, so a missing barrier in the kernel would surface on Apple
-silicon and could be invisible on Intel. Either answer sharpens the report: if
-it reproduces on Intel, it is an architecture-independent logic bug; if Intel is
-clean while the same OS build on arm64 is not, memory ordering becomes the lead.
+The two same-OS architecture pairs are the point, and they came back
+reproducing on both sides — see the table above. They exist because arm64 has a
+weaker memory model than x86's TSO, so a missing barrier in the kernel would
+surface on Apple silicon and could have been invisible on Intel. It was not, so
+that is not the lead.
 
 Two limits worth knowing. GitHub retired the `macos-13` image on 2025-12-04, so
 macOS 13 and earlier cannot be tested here at all — `macos-14` is the floor, and
-whether this predates Sonoma is not answerable from CI. And the `-intel` images
-are only Intel by label: `macos-15-intel` is the last x86_64 image Actions will
-offer, retiring in Fall 2027.
+whether this predates Sonoma is not answerable from CI. And `macos-15-intel` is
+the last x86_64 image Actions will offer, retiring in Fall 2027, after which this
+matrix loses its architecture pairs.
+
+Standard runners are free and unmetered on public repositories, macOS included;
+the run above reported 0 billable milliseconds for all five macOS legs. Only
+larger (`-large` / `-xlarge`) runners are billed on a public repository.
 
 Adding the paid `macos-14-large` leg (Intel, macOS 14) would complete the grid;
 it is left out because larger runners are billed even for public repositories.
@@ -213,7 +258,9 @@ It is one line in the matrix.
 ## Not tested
 
 - **Cross-uid racing.** Everything here is threads in one process under one uid.
-- **macOS 13 and earlier.** Not available on GitHub-hosted runners any more.
+- **Separate processes.** Likewise: every probe races threads, not processes.
+- **macOS 13 and earlier.** Not available on GitHub-hosted runners any more, so
+  the oldest version tested is 14.8.7.
 - **Filesystems other than APFS**, and network or case-sensitive volumes.
 - **Whether the create-or-open retry is really the mechanism.** That is a
   hypothesis from the syscall table, not something this repository demonstrates.
