@@ -73,9 +73,11 @@ Also measured:
     4-core machines, 66% to 79% on a 16-core one.
 
 
-IT IS FAIL-CLOSED, SO THIS IS A CORRECTNESS BUG RATHER THAN A SECURITY ONE
+WHAT WE CHECKED FOR SECURITY IMPACT, AND DID NOT FIND
 
-Stated explicitly so it is triaged correctly. Across 200 trials of 20 threads in
+Including this because a forged "does not exist" invites the assumption that
+something worse is reachable. We went looking for it. Across 200 trials of 20
+threads in
 each of three directory shapes, including a raced name that is a dangling
 symlink pointing out of the directory, and a world-writable sticky (01777)
 directory:
@@ -88,8 +90,10 @@ directory:
     retargeted. Its target was always what got created, and no opener ever
     received a non-target object.
 
-So the defect forges one errno and does nothing else. It is a hazard for callers
-that treat "does not exist" as a benign answer, not a primitive.
+On this evidence the defect forges one errno and does nothing else, which makes
+it a hazard for callers that treat "does not exist" as a benign answer rather
+than something an attacker could build on. Your call how to classify it, but we
+did not want to send it in without saying what we had already ruled out.
 
 
 WHERE THIS LOOKS LIKE IT COMES FROM

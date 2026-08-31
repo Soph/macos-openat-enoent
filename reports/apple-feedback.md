@@ -1,7 +1,8 @@
 Title: openat(2) with O_CREAT and without O_EXCL returns a spurious ENOENT when
 callers race the first creation of one name
 
-Area: macOS -> Kernel  (Filesystem, if that is offered instead)
+Area: macOS -> Other. The area list has no Kernel or Filesystem entry; the
+      title carries the routing, and Apple triage reroutes anyway.
 Reproducible: Yes, always
 Build: macOS 26.6 (25G72), Darwin Kernel Version 25.6.0, xnu-12377.161.13, Apple M4 Max
 
@@ -67,9 +68,10 @@ Also measured:
 - The rate scales with how much real parallelism the machine has: 5% to 9% on
   4-core machines, 66% to 79% on a 16-core one.
 
-## It is fail-closed, so this is a correctness bug rather than a security one
+## What we checked for security impact, and did not find
 
-Worth saying explicitly so it is triaged correctly. Across 200 trials of 20
+Including this because a forged "does not exist" invites the assumption that
+something worse is reachable. We went looking for it. Across 200 trials of 20
 threads in each of three directory shapes, including a raced name that is a
 dangling symlink pointing out of the directory, and a world-writable sticky
 (01777) directory:
@@ -82,8 +84,10 @@ dangling symlink pointing out of the directory, and a world-writable sticky
   retargeted. Its target was always what got created, and no opener ever received
   a non-target object.
 
-So the defect forges one errno and does nothing else. It is a hazard for callers
-that treat "does not exist" as a benign answer, not a primitive.
+On this evidence the defect forges one errno and does nothing else, which makes
+it a hazard for callers that treat "does not exist" as a benign answer rather
+than something an attacker could build on. Your call how to classify it, but we
+did not want to send it in without saying what we had already ruled out.
 
 ## Where this looks like it comes from
 
