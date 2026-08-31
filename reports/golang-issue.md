@@ -194,6 +194,15 @@ Two options, both confined to the darwin `openat` path.
 
 We prefer the second, but either would fix it.
 
+I am happy to put together a CL for either option if that is wanted. I have a
+machine that reproduces this reliably and the CI matrix above, so I can verify a
+fix rather than only propose one.
+
+One thing worth deciding early if you do want a CL: a regression test for this
+can only be probabilistic, and only on darwin, since it depends on the scheduler
+leaving the callers overlapping. It may fit better as a stress test than as a
+normal one. I am happy to follow whatever you prefer there.
+
 ### Related
 
 - #75114, `Root.MkdirAll` returning "file exists" when called concurrently on
