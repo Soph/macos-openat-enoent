@@ -8,9 +8,12 @@
 ### What did you do?
 
 Several goroutines call `Root.OpenFile` with `O_CREATE` on the same path through
-one shared `*os.Root`. `os.Root` is documented as safe for concurrent use, and
-`O_CREATE` without `O_EXCL` has two correct outcomes: the file was created, or
-the existing one was opened. So every caller should get a descriptor.
+one shared `*os.Root`. The `os.Root` documentation says:
+
+> Methods on Root are safe to be used from multiple goroutines simultaneously.
+
+And `O_CREATE` without `O_EXCL` has two correct outcomes: the file was created,
+or the existing one was opened. So every caller should get a descriptor.
 
 Reproducer, stdlib only:
 
@@ -213,7 +216,27 @@ normal one. I am happy to follow whatever you prefer there.
   document `O_RESOLVE_BENEATH`, but it would not avoid this, because the flat
   single-component case still goes through `openat` with `O_CREAT`.
 
-We intend to report this to Apple as well, since the defect is theirs. The reason
-to also fix it in Go is that `os.Root`'s documented concurrency guarantee is
-broken on a supported platform today, and an OS fix would reach only future
-macOS versions, while a Go-side change reaches every user on every macOS version.
+### Either way, the documentation is currently wrong
+
+`os.Root` already documents a list of platform-specific caveats, and one of them
+is a race condition:
+
+> Root's behavior differs on some platforms:
+>
+> [...]
+>
+>  - On Unix, Root.Chmod, Root.Chown, and Root.Chtimes are vulnerable to a race
+>    condition. If the target of the operation is changed from a regular file to
+>    a symlink while the operation is in progress, the operation may be performed
+>    on the link rather than the link target.
+
+`Root.OpenFile` with `O_CREATE` on darwin is not in that list, and "safe to be
+used from multiple goroutines simultaneously" sits directly above it. So one of
+two things has to change: either the behaviour, or that list gains a fourth
+bullet. As it stands the documentation makes a promise the platform does not
+keep, and callers have no way to know.
+
+We would much rather see the behaviour fixed. We intend to report this to Apple
+as well, since the defect is theirs, but an OS fix would reach only future macOS
+versions, while a Go-side change reaches every user on every macOS version they
+are actually running.
