@@ -1,0 +1,141 @@
+name: matrix
+
+# Runs the probes across every macOS runner image GitHub currently offers, plus
+# Linux on both architectures as a negative control, and collects the results
+# into one table in the run summary.
+#
+# The point of the matrix is to answer three questions the report needs:
+#   - does it reproduce on x86_64 as well as arm64? arm64 has a weaker memory
+#     model than x86's TSO, so a missing barrier in the kernel would show on
+#     Apple silicon and could be invisible on Intel. `macos-15` vs
+#     `macos-15-intel`, and `macos-26` vs `macos-26-intel`, are same-OS pairs
+#     that separate architecture from OS version.
+#   - how far back does it go? `macos-14` is the oldest image still offered.
+#   - is the harness sound? Linux runs the same code and must come out clean.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [README.md, LICENSE, .gitignore]
+  workflow_dispatch:
+    inputs:
+      threads:
+        description: "threads racing per trial (first stage)"
+        default: "20"
+      trials:
+        description: "trials per row (first stage)"
+        default: "200"
+      go_version:
+        description: "Go toolchain for the os.Root probe"
+        default: "stable"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS, Apple silicon. macos-14 is the oldest image still offered;
+          # macos-13 (the last Intel *standard* image before macos-15-intel)
+          # was retired on 2025-12-04, so there is no way to test macOS 13 or
+          # earlier here.
+          - { runner: macos-14, note: "macOS 14 Sonoma, Apple silicon (deprecated image)" }
+          - { runner: macos-15, note: "macOS 15 Sequoia, Apple silicon" }
+          - { runner: macos-26, note: "macOS 26 Tahoe, Apple silicon" }
+          # macOS, Intel. Standard runners, free for public repositories.
+          # x86_64 goes away entirely when macos-15-intel retires in Fall 2027.
+          - { runner: macos-15-intel, note: "macOS 15 Sequoia, Intel x86_64" }
+          - { runner: macos-26-intel, note: "macOS 26 Tahoe, Intel x86_64" }
+          # Negative controls: same source, same probes, must come out clean.
+          - { runner: ubuntu-24.04, note: "Linux x86_64 (negative control)" }
+          - { runner: ubuntu-24.04-arm, note: "Linux arm64 (negative control)" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ inputs.go_version || 'stable' }}
+          cache: false
+
+      - name: Run the probes
+        id: probe
+        env:
+          THREADS: ${{ inputs.threads || '20' }}
+          TRIALS: ${{ inputs.trials || '200' }}
+          RESULT_LABEL: ${{ matrix.runner }}
+        run: |
+          mkdir -p out
+          export RESULT_TSV="$PWD/out/record.tsv"
+          set +e
+          ./probe.sh 2>&1 | tee out/probe.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "rc=$rc" >>"$GITHUB_OUTPUT"
+          echo "probe.sh exited $rc"
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "### \`${{ matrix.runner }}\` — ${{ matrix.note }}"
+            echo
+            echo '```'
+            cat out/probe.log 2>/dev/null || echo "(no log; the probe did not run)"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: result-${{ matrix.runner }}
+          path: out/
+          if-no-files-found: warn
+
+      # Deliberately last, so the artifact and the summary exist either way.
+      # An ANOMALOUS or INTEGRITY verdict is a red job on purpose: it means the
+      # run is not interpretable, and a red job is harder to quote by mistake.
+      - name: Fail on an uninterpretable run
+        if: steps.probe.outputs.rc != '0'
+        run: |
+          echo "probe.sh exited ${{ steps.probe.outputs.rc }}:" \
+               "2 = a control row failed (suspect the harness or this machine)," \
+               "3 = the race was not fail-closed," \
+               "1 = build or setup failure." >&2
+          exit 1
+
+  aggregate:
+    name: table
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: result-*
+          path: results
+      - name: Build the table
+        run: |
+          shopt -s nullglob
+          files=(results/*/record.tsv)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No records were produced; every leg failed before emitting one." \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          {
+            echo "## Results"
+            echo
+            ./ci/summarize.sh "${files[@]}"
+            echo
+            echo "Full per-runner output is in each job's summary and in the \`result-*\` artifacts."
+          } | tee -a "$GITHUB_STEP_SUMMARY"

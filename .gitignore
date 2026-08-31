@@ -1,0 +1,4 @@
+openat_race
+other_syscalls
+out/
+*.log
