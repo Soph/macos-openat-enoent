@@ -161,7 +161,12 @@ if [ "${SKIP_GO:-0}" != "1" ] && command -v go >/dev/null 2>&1; then
     go_calls=$(sum_get "$gsum" suspect_calls)
     go_suspect=$(sum_get "$gsum" suspect_enoent)
     go_verdict=$(sum_get "$gsum" verdict)
-    [ -n "$go_verdict" ] || go_verdict="?"
+    # A Go probe that died before printing SUMMARY leaves these empty, which
+    # produced records like "?:/" that the table then rendered as a result.
+    [ -n "$go_verdict" ] || go_verdict="FAILED"
+    [ -n "$go_version" ] || go_version="?"
+    [ -n "$go_calls" ] || go_calls=0
+    [ -n "$go_suspect" ] || go_suspect=0
 else
     echo "--- Go probe skipped (no go toolchain, or SKIP_GO=1) ---"
     echo

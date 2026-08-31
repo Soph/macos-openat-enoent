@@ -19,10 +19,14 @@
  *   3. the directory is world-writable and sticky (01777), like /tmp.
  *
  * Every shape is checked for: a trial where nobody won, the name missing
- * afterwards, openers disagreeing about the inode, and a mode other than the
- * one requested. Shape 2 additionally checks that the symlink survived as a
- * symlink, that its target was the thing created, and that no opener saw a
- * non-target inode.
+ * afterwards, openers disagreeing about the object identity, a mode other than
+ * the one requested, an opener holding something that is not a regular file,
+ * and a descriptor that could not be stat'd at all. Shape 2 additionally checks
+ * that the symlink survived as a symlink, still points where it pointed, that
+ * its target was the thing created, and that no opener saw a non-target object.
+ *
+ * Identity is compared as (st_dev, st_ino). Inode numbers are unique only
+ * within a filesystem, and shape 2 points deliberately at a second directory.
  *
  * Build: cc -O2 -pthread -std=gnu11 -o failclosed c/failclosed.c
  * Usage: ./failclosed [threads] [trials]        (default 20 200)
@@ -72,14 +76,22 @@ static pthread_cond_t  g_release = PTHREAD_COND_INITIALIZER;
 
 static atomic_long c_ok, c_enoent, c_other;
 static atomic_int  c_last_errno;
+static atomic_int  c_statfail;      /* opened fine, but fstat failed          */
 
+/* Identity is (st_dev, st_ino), not st_ino alone: inode numbers are only
+ * unique within a filesystem, and the symlink shape deliberately points at a
+ * second directory that could be on another one. */
+static dev_t  *t_dev;
 static ino_t  *t_ino;
 static mode_t *t_mode;
+static int    *t_isreg;
 
 static void *worker(void *arg) {
     long idx = (long)arg;
+    t_dev[idx] = 0;
     t_ino[idx] = 0;
     t_mode[idx] = 0;
+    t_isreg[idx] = 0;
 
     pthread_mutex_lock(&g_mu);
     g_ready++;
@@ -103,8 +115,15 @@ static void *worker(void *arg) {
     }
     struct stat st;
     if (fstat(fd, &st) == 0) {
-        t_ino[idx]  = st.st_ino;
-        t_mode[idx] = st.st_mode & 07777;
+        t_dev[idx]   = st.st_dev;
+        t_ino[idx]   = st.st_ino;
+        t_mode[idx]  = st.st_mode & 07777;
+        t_isreg[idx] = S_ISREG(st.st_mode) ? 1 : 0;
+    } else {
+        /* Not "no information": a descriptor we hold that cannot be stat'd is
+         * itself an anomaly, and silently skipping it would hide exactly the
+         * kind of violation this program exists to catch. */
+        atomic_fetch_add(&c_statfail, 1);
     }
     close(fd);
     atomic_fetch_add(&c_ok, 1);
@@ -120,10 +139,13 @@ struct result {
     int  missing_after;
     int  inode_divergent;
     int  bad_mode;
+    int  bad_type;        /* an opener held something that is not a regular file */
+    int  stat_failed;     /* opened successfully, then fstat failed             */
     /* dangling-symlink shape only */
     int  link_clobbered;
     int  target_missing;
     int  wrong_object;
+    int  link_retargeted; /* the symlink still exists but points somewhere else */
 };
 
 static const char *parent_dir(void) {
@@ -138,8 +160,10 @@ static struct result run_shape(enum shape sh, int nt, int trials) {
     memset(&r, 0, sizeof r);
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256 * 1024);
+    int ae = pthread_attr_init(&attr);
+    if (ae) { fprintf(stderr, "pthread_attr_init: %s\n", strerror(ae)); exit(1); }
+    ae = pthread_attr_setstacksize(&attr, 256 * 1024);
+    if (ae) { fprintf(stderr, "pthread_attr_setstacksize: %s\n", strerror(ae)); exit(1); }
 
     for (int t = 0; t < trials; t++) {
         char dir[PATH_MAX], out[PATH_MAX], target[PATH_MAX + 64];
@@ -165,6 +189,7 @@ static struct result run_shape(enum shape sh, int nt, int trials) {
         g_ready = 0; g_armed = 0;
         atomic_store(&g_spinning, 0); atomic_store(&g_gate, 0);
         atomic_store(&c_ok, 0); atomic_store(&c_enoent, 0); atomic_store(&c_other, 0);
+        atomic_store(&c_statfail, 0);
 
         pthread_t th[MAX_THREADS];
         for (long i = 0; i < nt; i++) {
@@ -191,30 +216,46 @@ static struct result run_shape(enum shape sh, int nt, int trials) {
         long o = atomic_load(&c_other);
         r.other += o;
         if (o) r.last_errno = atomic_load(&c_last_errno);
+        r.stat_failed += atomic_load(&c_statfail);
         if (ok == 0) r.zero_winner++;
 
         struct stat st;
         if (sh == SHAPE_DANGLING_SYMLINK) {
             /* the link must still be a link: O_CREAT follows it, never replaces it */
-            if (fstatat(g_dirfd, NAME, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(st.st_mode))
+            if (fstatat(g_dirfd, NAME, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(st.st_mode)) {
                 r.link_clobbered++;
+            } else {
+                /* and it must still point where it pointed */
+                char seen[PATH_MAX + 64];
+                ssize_t n = readlinkat(g_dirfd, NAME, seen, sizeof seen - 1);
+                if (n < 0) {
+                    r.link_retargeted++;
+                } else {
+                    seen[n] = '\0';
+                    if (strcmp(seen, target) != 0) r.link_retargeted++;
+                }
+            }
             struct stat ts;
             if (stat(target, &ts) != 0) {
                 r.target_missing++;
             } else {
                 for (int i = 0; i < nt; i++)
-                    if (t_ino[i] && t_ino[i] != ts.st_ino) r.wrong_object++;
+                    if (t_ino[i] && (t_ino[i] != ts.st_ino || t_dev[i] != ts.st_dev))
+                        r.wrong_object++;
             }
         } else {
             if (fstatat(g_dirfd, NAME, &st, 0) != 0) r.missing_after++;
         }
 
-        ino_t first = 0;
+        ino_t first_ino = 0;
+        dev_t first_dev = 0;
+        int have_first = 0;
         for (int i = 0; i < nt; i++) {
             if (!t_ino[i]) continue;
-            if (!first) first = t_ino[i];
-            else if (t_ino[i] != first) r.inode_divergent++;
+            if (!have_first) { first_ino = t_ino[i]; first_dev = t_dev[i]; have_first = 1; }
+            else if (t_ino[i] != first_ino || t_dev[i] != first_dev) r.inode_divergent++;
             if (t_mode[i] != 0600) r.bad_mode++;
+            if (!t_isreg[i]) r.bad_type++;
         }
 
         char p[PATH_MAX + 64];
@@ -230,9 +271,11 @@ static struct result run_shape(enum shape sh, int nt, int trials) {
 }
 
 static int anomalies(enum shape sh, const struct result *r) {
-    int n = r->zero_winner + r->inode_divergent + r->bad_mode;
+    int n = r->zero_winner + r->inode_divergent + r->bad_mode + r->bad_type
+          + r->stat_failed;
     if (sh == SHAPE_DANGLING_SYMLINK)
-        n += r->link_clobbered + r->target_missing + r->wrong_object;
+        n += r->link_clobbered + r->target_missing + r->wrong_object
+           + r->link_retargeted;
     else
         n += r->missing_after;
     return n;
@@ -248,9 +291,11 @@ int main(int argc, char **argv) {
     }
     if (trials < 1) { fprintf(stderr, "trials must be >= 1\n"); return 1; }
 
-    t_ino  = calloc((size_t)nt, sizeof *t_ino);
-    t_mode = calloc((size_t)nt, sizeof *t_mode);
-    if (!t_ino || !t_mode) { perror("calloc"); return 1; }
+    t_dev   = calloc((size_t)nt, sizeof *t_dev);
+    t_ino   = calloc((size_t)nt, sizeof *t_ino);
+    t_mode  = calloc((size_t)nt, sizeof *t_mode);
+    t_isreg = calloc((size_t)nt, sizeof *t_isreg);
+    if (!t_dev || !t_ino || !t_mode || !t_isreg) { perror("calloc"); return 1; }
 
     static const struct { const char *label; enum shape sh; } shapes[] = {
         { "plain private directory",           SHAPE_PLAIN },
@@ -270,11 +315,13 @@ int main(int argc, char **argv) {
         struct result r = run_shape(shapes[i].sh, nt, trials);
         printf("  %-34s ok=%6ld spurious-ENOENT=%6ld other=%ld\n",
                shapes[i].label, r.ok, r.enoent, r.other);
-        printf("      no-winner trials=%d  inode-divergent=%d  wrong-mode=%d",
-               r.zero_winner, r.inode_divergent, r.bad_mode);
+        printf("      no-winner=%d  inode-divergent=%d  wrong-mode=%d  wrong-type=%d"
+               "  fstat-failed=%d",
+               r.zero_winner, r.inode_divergent, r.bad_mode, r.bad_type, r.stat_failed);
         if (shapes[i].sh == SHAPE_DANGLING_SYMLINK)
-            printf("  symlink-clobbered=%d  target-not-created=%d  opener-saw-wrong-object=%d\n",
-                   r.link_clobbered, r.target_missing, r.wrong_object);
+            printf("\n      symlink-clobbered=%d  symlink-retargeted=%d"
+                   "  target-not-created=%d  opener-saw-wrong-object=%d\n",
+                   r.link_clobbered, r.link_retargeted, r.target_missing, r.wrong_object);
         else
             printf("  name-missing-after=%d\n", r.missing_after);
         total_anom += anomalies(shapes[i].sh, &r);
@@ -296,8 +343,8 @@ int main(int argc, char **argv) {
     case 0:
         printf("FAIL-CLOSED -- in all three shapes the race forged an errno and did"
                " nothing else: some thread always won, the object always ended up"
-               " existing, no opener saw a different inode or an unrequested mode,"
-               " and the symlink was never clobbered.\n");
+               " existing, every opener held the same regular file with the mode it"
+               " asked for, and the symlink was neither clobbered nor retargeted.\n");
         break;
     case 2:
         printf("ANOMALOUS -- %ld call(s) failed with an unexpected errno (last: %d %s),"
@@ -312,7 +359,9 @@ int main(int argc, char **argv) {
                total_anom, total_anom == 1 ? "y" : "ies");
         break;
     }
+    free(t_dev);
     free(t_ino);
     free(t_mode);
+    free(t_isreg);
     return rc;
 }

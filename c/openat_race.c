@@ -172,8 +172,10 @@ static struct result run_row(const struct row *r, int nt, int trials) {
     memset(&res, 0, sizeof res);
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256 * 1024);   /* 1024 threads is fine */
+    int ae = pthread_attr_init(&attr);
+    if (ae) { fprintf(stderr, "pthread_attr_init: %s\n", strerror(ae)); exit(1); }
+    ae = pthread_attr_setstacksize(&attr, 256 * 1024);
+    if (ae) { fprintf(stderr, "pthread_attr_setstacksize: %s\n", strerror(ae)); exit(1); }   /* 1024 threads is fine */
 
     for (int t = 0; t < trials; t++) {
         char dir[PATH_MAX];

@@ -145,14 +145,16 @@ struct row {
 static int last_row_errno;
 
 static long run_row(const struct row *r, int nt, int trials,
-                    long *enoent_out, long *other_out,
+                    long *enoent_out, long *other_out, long *unexpected_eexist_out,
                     int *multi_winner_out, int *missing_out) {
     long ok = 0, enoent = 0, eexist = 0, other = 0;
     int last_errno = 0, multi_winner = 0, missing = 0;
 
     pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256 * 1024);
+    int ae = pthread_attr_init(&attr);
+    if (ae) { fprintf(stderr, "pthread_attr_init: %s\n", strerror(ae)); exit(1); }
+    ae = pthread_attr_setstacksize(&attr, 256 * 1024);
+    if (ae) { fprintf(stderr, "pthread_attr_setstacksize: %s\n", strerror(ae)); exit(1); }
 
     for (int t = 0; t < trials; t++) {
         char dir[PATH_MAX];
@@ -235,6 +237,11 @@ static long run_row(const struct row *r, int nt, int trials,
                "", last_errno, strerror(last_errno));
     *enoent_out = enoent;
     *other_out = other;
+    /* On an all_win row every thread should get through: non-EXCL openat means
+     * "create it or open it", and renameat replaces its destination. An EEXIST
+     * there is as wrong as an ENOENT, and was previously counted but never
+     * looked at. */
+    *unexpected_eexist_out = r->all_win ? eexist : 0;
     *multi_winner_out = multi_winner;
     *missing_out = missing;
     last_row_errno = last_errno;
@@ -270,14 +277,15 @@ int main(int argc, char **argv) {
            "syscall racing one name", "ok", "ENOENT", "EEXIST", "other", "integrity");
 
     char dirty[512] = "";
-    long openat_enoent = 0, elsewhere_enoent = 0, other_total = 0;
+    long openat_enoent = 0, elsewhere_enoent = 0, other_total = 0, unexpected_eexist = 0;
     int structural = 0, last_other_errno = 0;
     for (int i = 0; i < nrows; i++) {
-        long enoent, other; int multi, missing;
-        run_row(&rows[i], nt, trials, &enoent, &other, &multi, &missing);
+        long enoent, other, bad_eexist; int multi, missing;
+        run_row(&rows[i], nt, trials, &enoent, &other, &bad_eexist, &multi, &missing);
         other_total += other;
         if (other) last_other_errno = last_row_errno;
         structural += multi + missing;
+        unexpected_eexist += bad_eexist;
         if (rows[i].op == OP_OPENAT) {
             openat_enoent += enoent;
         } else if (enoent > 0) {
@@ -294,15 +302,15 @@ int main(int argc, char **argv) {
     const char *verdict;
     int rc;
     if (other_total > 0)          { verdict = "ANOMALOUS";    rc = 2; }
-    else if (elsewhere_enoent || structural) { verdict = "NOT-ISOLATED"; rc = 3; }
+    else if (elsewhere_enoent || structural || unexpected_eexist) { verdict = "NOT-ISOLATED"; rc = 3; }
     else if (openat_enoent > 0)   { verdict = "ISOLATED";     rc = 0; }
     else                          { verdict = "CLEAN";        rc = 0; }
 
     printf("\nSUMMARY threads=%d trials=%d calls_per_row=%d openat_enoent=%ld"
-           " other_syscall_enoent=%ld structural_anomalies=%d unexpected_errno=%ld"
-           " verdict=%s\n",
+           " other_syscall_enoent=%ld structural_anomalies=%d unexpected_eexist=%ld"
+           " unexpected_errno=%ld verdict=%s\n",
            nt, trials, nt * trials, openat_enoent, elsewhere_enoent, structural,
-           other_total, verdict);
+           unexpected_eexist, other_total, verdict);
     printf("VERDICT: ");
     switch (rc) {
     case 0:
@@ -322,6 +330,9 @@ int main(int argc, char **argv) {
         if (elsewhere_enoent)
             printf("NOT ISOLATED -- spurious ENOENT also from: %s. That is broader than"
                    " the reported bug; re-run and report it.\n", dirty);
+        else if (unexpected_eexist)
+            printf("NOT ISOLATED -- %ld EEXIST on a row where every thread should have"
+                   " succeeded. Re-run and report it.\n", unexpected_eexist);
         else
             printf("NOT ISOLATED -- %d structural anomal%s (a second winner, or the name"
                    " missing afterwards). Re-run and report it.\n",

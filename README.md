@@ -55,11 +55,17 @@ POSIX is narrower still. It permits `ENOENT` when `O_CREAT` is set only where "a
 component of the **path prefix** of `path` does not name an existing file" — a
 missing *final* component with `O_CREAT` set is explicitly excluded.
 
-That is not an academic standard to hold macOS to. Apple registers macOS to The
-Open Group's UNIX 03 Product Standard, and macOS 26.0 Tahoe is registered on
+`openat()` itself has been in POSIX since Issue 7 (POSIX.1-2008); the text above
+is from the current edition.
+
+Apple does formally register macOS against a POSIX product standard — macOS 26.0
+Tahoe is registered to UNIX 03 on
 [Apple silicon](https://www.opengroup.org/openbrand/register/brand3725.htm) and
 on [Intel](https://www.opengroup.org/openbrand/register/brand3720.htm), both
-dated 29-Aug-2025 — the same two architectures this reproduces on.
+dated 29-Aug-2025, the same two architectures this reproduces on. Take that as
+background rather than as proof, though: UNIX 03 maps to Issue 6, which predates
+`openat()`'s standardisation, so the certification does not itself cover this
+call. The load-bearing document here is Apple's own man page, which does.
 
 **The counter-argument, stated fairly.** POSIX's explicit *atomicity* guarantee
 is scoped to `O_CREAT|O_EXCL`: "The check for the existence of the file and the
@@ -189,8 +195,10 @@ to land.
 
 `openat` with `O_CREAT` is not the only `*at` syscall that creates a name in a
 directory, and not the only one that can lose a race for that name. Racing 20
-threads on one name through each of them, correct behaviour is exactly one
-winner, `EEXIST` for everyone else, and no `ENOENT` anywhere:
+threads on one name through each of them, correct behaviour depends on the row:
+non-`O_EXCL` `openat` and `renameat` should let *every* thread through, while the
+create-or-fail primitives should produce exactly one winner and `EEXIST` for the
+rest. What no row should ever produce is `ENOENT`:
 
 ```
   syscall racing one name                ok   ENOENT   EEXIST  other
@@ -315,9 +323,10 @@ this repository does not do. To keep the harness itself from being the story:
 
 ## Runner matrix
 
-`.github/workflows/matrix.yml` runs the probes on every macOS image GitHub
-currently offers, plus Linux on both architectures as a negative control, and
-collects the records into one table in the run summary.
+`.github/workflows/matrix.yml` runs the probes on every *standard* macOS runner
+image GitHub currently offers — the paid larger runners and the preview Xcode
+images are left out — plus Linux on both architectures as a negative control,
+and collects the records into one table in the run summary.
 
 | leg | why it is there |
 | --- | --- |
@@ -335,8 +344,10 @@ that is not the lead.
 Two limits worth knowing. GitHub retired the `macos-13` image on 2025-12-04, so
 macOS 13 and earlier cannot be tested here at all — `macos-14` is the floor, and
 whether this predates Sonoma is not answerable from CI. And `macos-15-intel` is
-the last x86_64 image Actions will offer, retiring in Fall 2027, after which this
-matrix loses its architecture pairs.
+scheduled to retire in Fall 2027, and GitHub has said x86_64 support on Actions
+ends with it — though `macos-26-intel` has since appeared, so treat the exact end
+date as GitHub's to move. Whenever it happens, this matrix loses its
+architecture pairs.
 
 Standard runners are free and unmetered on public repositories, macOS included;
 the run above reported 0 billable milliseconds for all five macOS legs. Only

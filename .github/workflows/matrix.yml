@@ -8,8 +8,11 @@ name: matrix
 #   - does it reproduce on x86_64 as well as arm64? arm64 has a weaker memory
 #     model than x86's TSO, so a missing barrier in the kernel would show on
 #     Apple silicon and could be invisible on Intel. `macos-15` vs
-#     `macos-15-intel`, and `macos-26` vs `macos-26-intel`, are same-OS pairs
-#     that separate architecture from OS version.
+#     `macos-15-intel`, and `macos-26` vs `macos-26-intel`, pair the same macOS
+#     generation across both architectures. They are adjacent patch builds
+#     rather than identical ones -- GitHub does not offer one build on both
+#     architectures -- so they support "arm64 is not required" rather than a
+#     build-for-build comparison.
 #   - how far back does it go? `macos-14` is the oldest image still offered.
 #   - is the harness sound? Linux runs the same code and must come out clean.
 
