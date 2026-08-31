@@ -167,24 +167,25 @@ interpretable, and they were clean on both.
 ### GitHub-hosted runners
 
 Every macOS image GitHub currently offers, plus Linux on both architectures,
-from [this run](https://github.com/Soph/macos-openat-enoent/actions/runs/33397596124)
+from [this run](https://github.com/Soph/macos-openat-enoent/actions/runs/33403656041)
 of `.github/workflows/matrix.yml` on 2026-08-31, at commit
-[`b884587`](https://github.com/Soph/macos-openat-enoent/commit/b8845879bd573105790f24a2c2352baca7344a73).
+[`a4cc826`](https://github.com/Soph/macos-openat-enoent/commit/a4cc826896bb5866256ca301e47bfbf8de75a31a).
 Per-runner logs and the raw records are attached to that run as `result-*`
 artifacts:
 
-| runner | OS | build | arch | cores | CPU | size | spurious `ENOENT` | verdict | isolation | fail-closed | Go 1.27.0 |
-| --- | --- | --- | --- | --: | --- | --- | --: | --- | --- | --- | --- |
-| `macos-14` | macOS 14.8.7 | 23J520 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 358 / 4000 (9%) | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 48 / 2000 |
-| `macos-15` | macOS 15.7.7 | 24G720 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 239 / 4000 (6%) | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 9 / 2000 |
-| `macos-26` | macOS 26.5.2 | 25F84 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 354 / 4000 (9%) | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 38 / 2000 |
-| `macos-15-intel` | macOS 15.7.9 | 24G830 | x86_64 | 4 | Core i7-8700B | 20×200 | 227 / 4000 (6%) | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 11 / 2000 |
-| `macos-26-intel` | macOS 26.6.1 | 25G76 | x86_64 | 4 | Core i7-8700B | 20×200 | 284 / 4000 (7%) | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 26 / 2000 |
-| `ubuntu-24.04` | Ubuntu 24.04.4, 6.17.0 | — | x86_64 | 4 | AMD EPYC 7763 | 40×1000 | 0 / 40000 | clean | CLEAN | FAIL-CLOSED | 0 / 2000 |
-| `ubuntu-24.04-arm` | Ubuntu 24.04.4, 6.17.0 | — | arm64 | 4 | — | 40×1000 | 0 / 40000 | clean | CLEAN | FAIL-CLOSED | 0 / 2000 |
+| runner | OS | build | arch | cores | CPU | size | spurious `ENOENT` | threads | processes | isolation | fail-closed | Go 1.27.0 |
+| --- | --- | --- | --- | --: | --- | --- | --: | --- | --- | --- | --- | --- |
+| `macos-14` | macOS 14.8.7 | 23J520 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 350 / 4000 (9%) | **REPRODUCES** | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 22 / 2000 |
+| `macos-15` | macOS 15.7.7 | 24G720 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 318 / 4000 (8%) | **REPRODUCES** | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 37 / 2000 |
+| `macos-26` | macOS 26.5.2 | 25F84 | arm64 | 3 | Apple M1 (Virtual) | 20×200 | 352 / 4000 (9%) | **REPRODUCES** | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 32 / 2000 |
+| `macos-15-intel` | macOS 15.7.9 | 24G830 | x86_64 | 4 | Core i7-8700B | 20×200 | 227 / 4000 (6%) | **REPRODUCES** | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 7 / 2000 |
+| `macos-26-intel` | macOS 26.6.1 | 25G76 | x86_64 | 4 | Core i7-8700B | 20×200 | 216 / 4000 (5%) | **REPRODUCES** | **REPRODUCES** | ISOLATED | FAIL-CLOSED | 11 / 2000 |
+| `ubuntu-24.04` | Ubuntu 24.04.4 | — | x86_64 | 4 | AMD EPYC 7763 | 40×1000 | 0 / 40000 | clean | clean | CLEAN | FAIL-CLOSED | 0 / 2000 |
+| `ubuntu-24.04-arm` | Ubuntu 24.04.4 | — | arm64 | 4 | — | 40×1000 | 0 / 40000 | clean | clean | CLEAN | FAIL-CLOSED | 0 / 2000 |
 
-Every control row was clean, every row was fail-closed, and every run put all of
-its spurious `ENOENT` in the one `openat` row, on all seven runners.
+Every control row was clean, every row was fail-closed, every run put all of its
+spurious `ENOENT` in the one `openat` row, and every macOS leg reproduced it with
+forked processes as well as with threads, on all seven runners.
 
 Four things follow.
 
@@ -195,8 +196,8 @@ therefore not needed to explain this, which makes a missing barrier the less
 likely story and an architecture-independent defect in the create-or-open
 fallback the more likely one.
 
-Across three runs of the matrix, the arm64 legs ranged 5.6–9.6% and the Intel
-legs 5.5–7.1%. Those bands overlap, and the run-to-run spread on a single leg
+Across four runs of the matrix, the arm64 legs ranged 5.6–9.6% and the Intel
+legs 5.4–7.1%. Those bands overlap, and the run-to-run spread on a single leg
 (`macos-15` went 6%, 8%, 6%) is as large as the difference between the
 architectures — so the honest claim is that Intel reproduces at the same order
 of magnitude, not that it matches rate for rate. The pairs are also adjacent
