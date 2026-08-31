@@ -14,13 +14,13 @@ fi
 
 cat "$@" | sort | awk -F'\t' '
 BEGIN {
-    print "| runner | OS | build | arch | cores | CPU | fs | size | openat O_CREAT spurious ENOENT | controls | verdict | isolation | fail-closed | Go |"
-    print "| --- | --- | --- | --- | --: | --- | --- | --- | --- | --: | --- | --- | --- | --- |"
+    print "| runner | OS | build | arch | cores | CPU | fs | size | openat O_CREAT spurious ENOENT | controls | verdict | processes | isolation | fail-closed | Go |"
+    print "| --- | --- | --- | --- | --: | --- | --- | --- | --- | --: | --- | --- | --- | --- | --- |"
 }
 {
     label=$1; os=$2; ver=$3; build=$4; arch=$5; cores=$6; cpu=$7; fs=$8;
     stage=$9; threads=$10; trials=$11; calls=$12; suspect=$13; control=$14;
-    verdict=$15; goversion=$16; gores=$17; isolation=$18; failclosed=$19;
+    verdict=$15; goversion=$16; gores=$17; isolation=$18; failclosed=$19; procs=$20;
 
     rate = (calls > 0) ? sprintf("%d / %d (%.0f%%)", suspect, calls, 100*suspect/calls) \
                        : sprintf("%d / ?", suspect);
@@ -29,9 +29,10 @@ BEGIN {
          : (verdict == "CLEAN")      ? "clean" : verdict;
     go = (goversion == "-") ? "-" : sprintf("%s %s", goversion, gores);
 
-    printf "| `%s` | %s %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
+    printf "| `%s` | %s %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s |\n",
         label, os, ver, build, arch, cores, cpu, fs, size, rate, control, mark,
-        (isolation == "" ? "-" : isolation), (failclosed == "" ? "-" : failclosed), go;
+        (procs == "" ? "-" : procs), (isolation == "" ? "-" : isolation),
+        (failclosed == "" ? "-" : failclosed), go;
 
     if (verdict == "REPRODUCES") repro++
     else if (verdict == "CLEAN") clean++

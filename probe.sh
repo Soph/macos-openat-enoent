@@ -83,7 +83,7 @@ echo
 
 # ------------------------------------------------------------------ build ---
 
-for src in openat_race other_syscalls failclosed; do
+for src in openat_race other_syscalls failclosed processes; do
     if ! cc -O2 -pthread -std=gnu11 -Wall -Wextra -o "$bin/$src" "$here/c/$src.c"; then
         echo "FATAL: failed to build c/$src.c" >&2
         exit 1
@@ -138,6 +138,18 @@ osc_verdict=$(sum_get "$(grep '^SUMMARY ' "$osc_log" | tail -1)" verdict)
 [ -n "$osc_verdict" ] || osc_verdict="?"
 echo
 
+echo "--- C probe, separate processes rather than threads ---"
+# Halved trials: a fork is a lot more expensive than a thread, and this probe
+# only has to answer yes/no rather than measure a rate precisely.
+proc_trials=$((trials / 2))
+[ "$proc_trials" -ge 1 ] || proc_trials=1
+proc_log=$bin/proc.log
+"$bin/processes" "$threads" "$proc_trials" 2>&1 | tee "$proc_log"
+note_rc "${PIPESTATUS[0]}"
+proc_verdict=$(sum_get "$(grep '^SUMMARY ' "$proc_log" | tail -1)" verdict)
+[ -n "$proc_verdict" ] || proc_verdict="?"
+echo
+
 echo "--- C probe, is the race fail-closed? (incl. the two attack shapes) ---"
 fc_log=$bin/fc.log
 "$bin/failclosed" "$threads" "$trials" 2>&1 | tee "$fc_log"
@@ -174,10 +186,11 @@ fi
 
 # ---------------------------------------------------------------- record ----
 
-record=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+record=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "$label" "$os_name" "$os_version" "$os_build" "$arch" "$cores" "$cpu" "$fstype" \
     "$stage" "$c_threads" "$c_trials" "$c_calls" "$c_suspect" "$c_control" "$c_verdict" \
-    "$go_version" "$go_verdict:$go_suspect/$go_calls" "$osc_verdict" "$fc_verdict")
+    "$go_version" "$go_verdict:$go_suspect/$go_calls" "$osc_verdict" "$fc_verdict" \
+    "$proc_verdict")
 
 echo "RECORD	$record"
 if [ -n "${RESULT_TSV:-}" ]; then
@@ -186,8 +199,8 @@ fi
 
 echo
 case "$worst" in
-0) echo "OVERALL: every probe interpretable -- openat=$c_verdict isolation=$osc_verdict" \
-        "fail-closed=$fc_verdict go=$go_verdict" ;;
+0) echo "OVERALL: every probe interpretable -- openat=$c_verdict processes=$proc_verdict" \
+        "isolation=$osc_verdict fail-closed=$fc_verdict go=$go_verdict" ;;
 2) echo "OVERALL: ANOMALOUS -- a control row returned ENOENT, or a call failed with an" \
         "unexpected errno. Suspect the harness or this machine, not the kernel." ;;
 3) echo "OVERALL: a probe reported a STRONGER finding than expected (the race was not" \

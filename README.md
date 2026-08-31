@@ -80,6 +80,28 @@ one of the enumerated errors, and `ENOENT` is not one of them for this case in
 either Apple's documentation or POSIX's. The defect is the errno, not the
 interleaving.
 
+## Has this been reported before?
+
+Not upstream. There is no golang/go issue for it (all 40 `os.Root` issues, open
+and closed, checked 2026-08-31; the closest is
+[#75114](https://github.com/golang/go/issues/75114), a different operation), and
+no public Apple report — though Feedback Assistant is not publicly searchable, so
+that shows only that nothing public exists.
+
+It has been hit and fixed downstream at least once, independently:
+[spiceai/spiceai#13232](https://github.com/spiceai/spiceai/issues/13232),
+"Concurrent lock creation fails with a spurious ENOENT on macOS", found from
+flaky lock-file tests, diagnosed to the same syscall on Darwin 25.6.0 with the
+same controls (absolute path clean, `O_EXCL` clean), and worked around in
+[#13231](https://github.com/spiceai/spiceai/pull/13231) with a bounded retry.
+Their measurement is worth quoting for anyone weighing a retry: **one further
+look always sufficed — 0 failures in 14,400 attempts across 8 threads, 32
+threads and 8 processes, deepest retry depth 1.**
+
+That independent confirmation, in a different language and a different codebase,
+is stronger evidence than this repository alone. It also means the practical
+answer is already established: callers can avoid this today, and some already do.
+
 ## Running it
 
 ```sh
@@ -101,6 +123,7 @@ The probes can also be run individually:
 cc -O2 -pthread -std=gnu11 -o openat_race    c/openat_race.c    && ./openat_race 20 200
 cc -O2 -pthread -std=gnu11 -o other_syscalls c/other_syscalls.c && ./other_syscalls 20 200
 cc -O2 -pthread -std=gnu11 -o failclosed     c/failclosed.c     && ./failclosed 20 200
+cc -O2 -pthread -std=gnu11 -o processes      c/processes.c      && ./processes 20 100
 cd go && go run . -threads 20 -trials 50
 ```
 
@@ -197,6 +220,26 @@ on 3–4 cores where a 16-core laptop scores 66–79%. A low number on a small
 machine is not a mild version of the bug; it is the same bug with fewer chances
 to land.
 
+### It is not a threading artifact
+
+`c/processes.c` forks instead of spawning threads: N children, released
+together, sharing nothing but an `mmap`'d counter block and an inherited
+directory descriptor. Measured on macOS 26.6 (25G72), 20 children × 100 trials:
+
+```
+  row                                            ok   ENOENT   EEXIST  other
+  openat O_RDWR|O_CREAT    file ABSENT          464     1536        0      0
+  openat O_RDWR|O_CREAT|O_EXCL  ABSENT          100        0     1900      0
+  open   O_RDWR|O_CREAT    file ABSENT         2000        0        0      0
+
+VERDICT: REPRODUCES ACROSS PROCESSES -- 1536 of 2000 ... both controls clean
+```
+
+77%, which is the same order as the threaded rate on the same machine. So this is
+not a pthreads or a Go-scheduler artifact — and it is the case that matters in
+practice, because concurrent creation of one name is usually several *processes*
+reaching for the same lock, log or queue file, not several threads in one program.
+
 ### It is one operation, not path resolution
 
 `openat` with `O_CREAT` is not the only `*at` syscall that creates a name in a
@@ -225,6 +268,58 @@ The single misbehaving row is the only operation in the set with a
 **create-or-open fallback** — where a create that fails with `EEXIST` is retried
 as an open. That retry is the hypothesis worth testing; it is not path
 resolution, because the row above it resolves the same path the same way.
+
+### The mechanism, in Apple's published source
+
+The create-or-open fallback the table above points at is visible in
+`vn_open_auth()`, the function `openat(2)` reaches through `open1()`. Line
+numbers are against tag
+[`xnu-12377.121.6`](https://github.com/apple-oss-distributions/xnu/tree/xnu-12377.121.6)
+— the nearest published tag to the `xnu-12377.161.13` this reproduces on, since
+that exact build is not published. `main` differs, so do not cite line numbers
+from it.
+
+Losing the create race retries as an open
+([`vfs_vnops.c:524`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/vfs/vfs_vnops.c#L524)):
+
+```c
+if ((error == EEXIST) && !(fmode & O_EXCL)) {
+        if (vp) { vnode_put(vp); }
+        nameidone(ndp);
+        goto again;
+}
+```
+
+`goto again` re-enters the `O_CREAT` branch, whose own lookup exits without any
+retry
+([`vfs_vnops.c:480`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/vfs/vfs_vnops.c#L480)):
+
+```c
+continue_create_lookup:
+        if ((error = namei(ndp))) {
+                goto out;
+        }
+```
+
+Meanwhile the same function already treats this exact condition as retryable,
+bounded at `max_retries = 10` with progressive yielding, in the sibling path
+reached when a vnode was obtained and then reported gone
+([`vfs_vnops.c:790`](https://github.com/apple-oss-distributions/xnu/blob/xnu-12377.121.6/bsd/vfs/vfs_vnops.c#L790)):
+
+```c
+if (((error == ENOENT) && (*fmodep & O_CREAT)) || (error == EREDRIVEOPEN) || ref_failed) {
+```
+
+So "`ENOENT` when the caller asked for `O_CREAT` means retry" is already Apple's
+own policy, with a bound and a yield strategy worked out. It just does not cover
+the `namei()` exit.
+
+**This is an argument, not a measurement.** It is a code path consistent with what
+the probes observe, plus an existing retry that does not cover it. Which of the
+two `ENOENT` exits the probes actually take is not established here: the
+bounded-retry path logs when it gives up, but no kernel-process messages are
+visible to `log show` on the machine tested, so that check was inconclusive
+rather than supportive. Settling it needs `dtrace`/`ktrace` or a KDK build.
 
 ### It is fail-closed
 
@@ -313,7 +408,7 @@ libSystem, so these probes do not by themselves separate the kernel from the
 libc wrapper; assigning it specifically to XNU would need syscall tracing, which
 this repository does not do. To keep the harness itself from being the story:
 
-- all three C probes build warning-free under Apple clang and GCC 16, at
+- all four C probes build warning-free under Apple clang and GCC 16, at
   `-Wall -Wextra -Werror`, under strict `-std=c11` as well as `-std=gnu11`;
 - every probe enforces its own claim in its exit code rather than leaving it to
   the reader: an unexpected errno anywhere makes a run `ANOMALOUS` (exit 2), a
@@ -365,8 +460,7 @@ It is one line in the matrix.
 
 ## Not tested
 
-- **Cross-uid racing.** Everything here is threads in one process under one uid.
-- **Separate processes.** Likewise: every probe races threads, not processes.
+- **Cross-uid racing.** Every probe runs as a single uid.
 - **macOS 13 and earlier.** Not available on GitHub-hosted runners any more, so
   the oldest version tested is 14.8.7.
 - **Filesystems other than APFS**, and network or case-sensitive volumes.
@@ -399,6 +493,7 @@ probe.sh                       build and run everything; prints one record line
 c/openat_race.c                the headline probe: 1 suspect row, 5 controls
 c/other_syscalls.c             mkdirat / symlinkat / linkat / renameat for contrast
 c/failclosed.c                 is it fail-closed? incl. the two attack shapes
+c/processes.c                  the same race across forked processes, not threads
 go/main.go                     os.Root vs plain os.*, with controls
 ci/summarize.sh                records -> markdown table
 .github/workflows/matrix.yml   the runner matrix
