@@ -1,44 +1,30 @@
-Title: openat(2) with O_CREAT and without O_EXCL returns a spurious ENOENT when
-callers race the first creation of one name
+Title: openat(2) with O_CREAT and without O_EXCL returns a spurious ENOENT when callers race the first creation of one name
 
 Area: macOS -> Other. The area list has no Kernel or Filesystem entry; the
       title carries the routing, and Apple triage reroutes anyway.
-Reproducible: Yes, always
-Build: macOS 26.6 (25G72), Darwin Kernel Version 25.6.0, xnu-12377.161.13, Apple M4 Max
+Reproducible: Yes, always Build: macOS 26.6 (25G72), Darwin Kernel Version 25.6.0, xnu-12377.161.13, Apple M4 Max
 
 ## Summary
 
-When several callers race `openat(dirfd, name, O_RDWR|O_CREAT, 0600)` on the same
-not-yet-existing name in one directory, one caller creates the file and most of
-the others receive `ENOENT` instead of a descriptor to the file that was just
-created. The directory is held open by the descriptor passed in, and it exists
-throughout. `access()` on the name succeeds immediately afterwards.
+When several callers race `openat(dirfd, name, O_RDWR|O_CREAT, 0600)` on the same not-yet-existing name in one directory, one caller creates the file and most of the others receive `ENOENT` instead of a descriptor to the file that was just created. The directory is held open by the descriptor passed in, and it exists throughout. `access()` on the name succeeds immediately afterwards.
 
-`O_CREAT` without `O_EXCL` has two correct outcomes: the file was created, or an
-existing one was opened. `ENOENT` is neither.
+`O_CREAT` without `O_EXCL` has two correct outcomes: the file was created, or an existing one was opened. `ENOENT` is neither.
 
-This is not a permitted error for this call. The `open(2)` man page lists exactly
-two `ENOENT` conditions and neither applies here:
+This is not a permitted error for this call. The `open(2)` man page lists exactly two `ENOENT` conditions and neither applies here:
 
     [ENOENT]  O_CREAT is not set and the named file does not exist.
     [ENOENT]  A component of the path name that must exist does not exist.
 
-`O_CREAT` is set, which rules out the first. The only path component is the file
-being created, which is precisely the component that is not required to exist,
-which rules out the second. POSIX is narrower still: with `O_CREAT` set it permits
-`ENOENT` only when a component of the path *prefix* does not name an existing
-file.
+`O_CREAT` is set, which rules out the first. The only path component is the file being created, which is precisely the component that is not required to exist, which rules out the second. POSIX is narrower still: with `O_CREAT` set it permits `ENOENT` only when a component of the path *prefix* does not name an existing file.
 
 ## Steps to reproduce
 
 1. Extract the attached archive.
-2. Run `./run.sh`. It needs only `cc`, writes only to a temporary directory, and
-   cleans up after itself.
+2. Run `./run.sh`. It needs only `cc`, writes only to a temporary directory, and cleans up after itself.
 
 Expected: the suspect row reports 0 spurious `ENOENT`, like all five control rows.
 
-Actual: the suspect row reports 25% to 75% spurious `ENOENT`, while every control
-row is clean.
+Actual: the suspect row reports 25% to 75% spurious `ENOENT`, while every control row is clean.
 
 ## What is and is not affected
 
@@ -54,74 +40,42 @@ Measured with 20 threads racing one name, 200 trials, 4000 calls per row:
 | `mkdirat`, `symlinkat`, `linkat` racing one name | correct: one winner, rest `EEXIST` |
 | `renameat` racing one name | correct |
 
-So the only misbehaving call in the set is the one with a create-or-open
-fallback, where a create that fails with `EEXIST` is retried as an open.
+So the only misbehaving call in the set is the one with a create-or-open fallback, where a create that fails with `EEXIST` is retried as an open.
 
 Also measured:
 
-- Separate processes fail the same way as threads, so it is not a threading
-  artifact.
-- Reproduces on 14.8.7 (23J520), 15.7.7 (24G720), 15.7.9 (24G830), 26.5.2
-  (25F84), 26.6 (25G72), 26.6.1 (25G76) and 26.6.2 (25G83).
-- Reproduces on both Apple silicon and Intel, so it is not architecture
-  specific.
-- The rate scales with how much real parallelism the machine has: 5% to 9% on
-  4-core machines, 66% to 79% on a 16-core one.
+- Separate processes fail the same way as threads, so it is not a threading artifact.
+- Reproduces on 14.8.7 (23J520), 15.7.7 (24G720), 15.7.9 (24G830), 26.5.2 (25F84), 26.6 (25G72), 26.6.1 (25G76) and 26.6.2 (25G83).
+- Reproduces on both Apple silicon and Intel, so it is not architecture specific.
+- The rate scales with how much real parallelism the machine has: 5% to 9% on 4-core machines, 66% to 79% on a 16-core one.
 
 ## What we checked for security impact, and did not find
 
-Including this because a forged "does not exist" invites the assumption that
-something worse is reachable. We went looking for it. Across 200 trials of 20
-threads in each of three directory shapes, including a raced name that is a
-dangling symlink pointing out of the directory, and a world-writable sticky
-(01777) directory:
+Including this because a forged "does not exist" invites the assumption that something worse is reachable. We went looking for it. Across 200 trials of 20 threads in each of three directory shapes, including a raced name that is a dangling symlink pointing out of the directory, and a world-writable sticky (01777) directory:
 
 - Some caller always won. There was never a trial with no successful create.
 - The object always existed afterwards.
-- Every successful opener saw the same `(st_dev, st_ino)` and the mode it asked
-  for, and always a regular file.
-- The dangling symlink was never clobbered into a regular file and never
-  retargeted. Its target was always what got created, and no opener ever received
-  a non-target object.
+- Every successful opener saw the same `(st_dev, st_ino)` and the mode it asked for, and always a regular file.
+- The dangling symlink was never clobbered into a regular file and never retargeted. Its target was always what got created, and no opener ever received a non-target object.
 
-On this evidence the defect forges one errno and does nothing else, which makes
-it a hazard for callers that treat "does not exist" as a benign answer rather
-than something an attacker could build on. Your call how to classify it, but we
-did not want to send it in without saying what we had already ruled out.
+On this evidence the defect forges one errno and does nothing else, which makes it a hazard for callers that treat "does not exist" as a benign answer rather than something an attacker could build on. Your call how to classify it, but we did not want to send it in without saying what we had already ruled out.
 
 ## Where this looks like it comes from
 
-Offered as a starting point rather than a diagnosis. In the published source for
-`xnu-12377.121.6`, which is the nearest published tag to the kernel above:
+Offered as a starting point rather than a diagnosis. In the published source for `xnu-12377.121.6`, which is the nearest published tag to the kernel above:
 
-- `bsd/vfs/vfs_vnops.c:524`, in `vn_open_auth()`, is the create-or-open fallback.
-  A create that fails with `EEXIST` and no `O_EXCL` does `nameidone(ndp); goto
-  again;`.
-- `goto again` re-enters the `O_CREAT` branch, whose lookup at
-  `bsd/vfs/vfs_vnops.c:480` is `continue_create_lookup: if ((error =
-  namei(ndp))) { goto out; }`. That exit has no retry.
-- `bsd/vfs/vfs_vnops.c:790`, in the same function, already treats this exact
-  condition as retryable in the sibling path reached when a vnode was obtained
-  and then reported gone: `if (((error == ENOENT) && (*fmodep & O_CREAT)) || ...`,
-  bounded by `max_retries = 10` with progressive yielding.
+- `bsd/vfs/vfs_vnops.c:524`, in `vn_open_auth()`, is the create-or-open fallback. A create that fails with `EEXIST` and no `O_EXCL` does `nameidone(ndp); goto again;`.
+- `goto again` re-enters the `O_CREAT` branch, whose lookup at `bsd/vfs/vfs_vnops.c:480` is `continue_create_lookup: if ((error = namei(ndp))) { goto out; }`. That exit has no retry.
+- `bsd/vfs/vfs_vnops.c:790`, in the same function, already treats this exact condition as retryable in the sibling path reached when a vnode was obtained and then reported gone: `if (((error == ENOENT) && (*fmodep & O_CREAT)) || ...`, bounded by `max_retries = 10` with progressive yielding.
 
-If that reading is right, the smallest change would be to extend the retry policy
-already in that function to the `namei()` exit in the `O_CREAT` branch. I have not
-confirmed which of the two `ENOENT` exits the reproduction takes, and cannot from
-userspace.
+If that reading is right, the smallest change would be to extend the retry policy already in that function to the `namei()` exit in the `O_CREAT` branch. I have not confirmed which of the two `ENOENT` exits the reproduction takes, and cannot from userspace.
 
 ## Impact
 
-Any code that creates a file relative to a directory descriptor, which is the
-recommended pattern for avoiding symlink races, and does so from more than one
-thread or process. Lock files are the worst case, because a lock nobody can take
-stops serializing silently. It also reaches every program using Go's `os.Root`,
-which is built on `openat`: see golang/go#81246.
+Any code that creates a file relative to a directory descriptor, which is the recommended pattern for avoiding symlink races, and does so from more than one thread or process. Lock files are the worst case, because a lock nobody can take stops serializing silently. It also reaches every program using Go's `os.Root`, which is built on `openat`: see golang/go#81246.
 
 ## Attachments
 
-- `openat-enoent-repro.tar.gz`: four self-contained C programs plus `run.sh`.
-  No dependencies beyond `cc`.
+- `openat-enoent-repro.tar.gz`: four self-contained C programs plus `run.sh`. No dependencies beyond `cc`.
 
-Happy to provide a sysdiagnose, run a variant, or test a candidate fix on any of
-the builds listed above.
+Happy to provide a sysdiagnose, run a variant, or test a candidate fix on any of the builds listed above.

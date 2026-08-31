@@ -160,6 +160,17 @@ struct result {
     int  bad_mode;        /* openers that saw a mode other than 0600       */
 };
 
+/* Some filesystems have no Unix permission bits or stable inode numbers of
+ * their own, and synthesize both at the mount layer. exFAT stores 0700 when
+ * asked for 0600, and its synthesized st_ino is not a usable identity during
+ * concurrent creation. On such a filesystem the mode and inode checks below say
+ * nothing about this bug, and reporting them as integrity violations buries the
+ * finding under noise the reader then has to dismiss by hand. So probe for the
+ * capability once and skip exactly those two checks when it is absent. The
+ * ENOENT counts, which are what this program exists to measure, are unaffected
+ * either way. */
+static int unix_perm_semantics = 1;
+
 static const char *parent_dir(void) {
     const char *p = getenv("RACE_DIR");
     if (!p || !*p) p = getenv("TMPDIR");
@@ -239,8 +250,8 @@ static struct result run_row(const struct row *r, int nt, int trials) {
         for (int i = 0; i < nt; i++) {
             if (!t_ino[i]) continue;
             if (!first) first = t_ino[i];
-            else if (t_ino[i] != first) res.inode_divergent++;
-            if (t_mode[i] != 0600) res.bad_mode++;
+            else if (unix_perm_semantics && t_ino[i] != first) res.inode_divergent++;
+            if (unix_perm_semantics && t_mode[i] != 0600) res.bad_mode++;
         }
 
         unlink(g_full);
@@ -306,8 +317,32 @@ int main(int argc, char **argv) {
     };
     const int nrows = (int)(sizeof rows / sizeof rows[0]);
 
+    /* capability probe: does this filesystem keep the mode we ask for? */
+    {
+        char dir[PATH_MAX];
+        snprintf(dir, sizeof dir, "%s/oarcapXXXXXX", parent_dir());
+        if (mkdtemp(dir)) {
+            int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) {
+                int fd = openat(dfd, "cap", O_RDWR | O_CREAT, 0600);
+                if (fd >= 0) {
+                    struct stat st;
+                    if (fstat(fd, &st) == 0 && (st.st_mode & 07777) != 0600)
+                        unix_perm_semantics = 0;
+                    close(fd);
+                }
+                unlinkat(dfd, "cap", 0);
+                close(dfd);
+            }
+            rmdir(dir);
+        }
+    }
+
     printf("openat_race: %d threads x %d trials = %d calls per %srow\n",
            nt, trials, nt * trials, keyonly ? "key " : "");
+    if (!unix_perm_semantics)
+        printf("note: this filesystem does not preserve the requested mode, so the mode\n"
+               "      and inode-identity checks are skipped as meaningless here\n");
     printf("temp dirs under: %s\n\n", parent_dir());
     printf("  %-40s %8s %8s %8s %6s  %s\n",
            "row", "ok", "ENOENT", "EEXIST", "other", "integrity");
