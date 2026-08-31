@@ -77,10 +77,9 @@ WHAT WE CHECKED FOR SECURITY IMPACT, AND DID NOT FIND
 
 Including this because a forged "does not exist" invites the assumption that
 something worse is reachable. We went looking for it. Across 200 trials of 20
-threads in
-each of three directory shapes, including a raced name that is a dangling
-symlink pointing out of the directory, and a world-writable sticky (01777)
-directory:
+threads in each of three directory shapes, including a raced name that is a
+dangling symlink pointing out of the directory, and a world-writable sticky
+(01777) directory:
 
   - Some caller always won. There was never a trial with no successful create.
   - The object always existed afterwards.
