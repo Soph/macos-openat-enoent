@@ -244,3 +244,10 @@ sense is your call. I will report this to Apple too, since the defect is
 theirs. The only thing I would add for prioritisation is that an OS fix would
 reach future macOS versions, while a change in Go would reach people on the
 versions they are running today.
+
+### Disclosure
+
+I used an AI assistant to research and write this up. Every number in it comes
+from a run on a machine I control or from the CI matrix linked above, the
+reproducer was compiled and run as it appears here, and the man page and kernel
+source quotes are from the versions named.
