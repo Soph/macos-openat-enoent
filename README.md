@@ -85,9 +85,11 @@ interleaving.
 - **Go: [golang/go#81246](https://github.com/golang/go/issues/81246)**, filed
   2026-08-31. The report text is kept in
   [`reports/golang-issue.md`](reports/golang-issue.md).
-- Apple: not yet filed. The report text and the attachment are ready in
-  [`reports/apple-feedback.md`](reports/apple-feedback.md) and
-  `reports/openat-enoent-repro.tar.gz`.
+- **Apple: FB24592276**, filed 2026-08-31 through Feedback Assistant with the
+  reproduction attached. The report text is in
+  [`reports/apple-feedback.txt`](reports/apple-feedback.txt) (the plain-text
+  version that was submitted) and
+  [`reports/apple-feedback.md`](reports/apple-feedback.md).
 
 ## Had it been reported before?
 
