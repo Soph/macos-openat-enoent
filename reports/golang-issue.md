@@ -154,8 +154,9 @@ Two options, both confined to the darwin `openat` path:
 2. **Split create-or-open into `O_CREATE|O_EXCL` then a plain open**, so the
    broken path is never taken. This is deterministic rather than probabilistic
    and needs no retry budget. It costs one extra syscall only on first creation.
-   We shipped this in our own codebase and it took the failure rate from 4806 in
-   6000 racing opens to 0.
+   In our own codebase this took a lock-file open from 4806 failures in 6000
+   racing opens to 0, and a flaky test from 12 failures in 20 fresh processes
+   to 0 in 20.
 
 ### Related
 
@@ -167,7 +168,7 @@ Two options, both confined to the darwin `openat` path:
   documents `O_RESOLVE_BENEATH`, but it would not avoid this: the flat
   single-component case still goes through `openat` with `O_CREAT`.
 
-An Apple report is being filed separately, since the defect is theirs. The reason
+We intend to report this to Apple as well, since the defect is theirs. The reason
 to also fix it here is that `os.Root`'s documented concurrency guarantee is
 broken on a supported platform today, and an OS fix — if it comes — reaches only
 future macOS versions, while a Go-side change reaches every user on every macOS
